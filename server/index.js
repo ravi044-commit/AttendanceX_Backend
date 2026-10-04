@@ -1543,9 +1543,25 @@ app.get('/api/face/count/:uid', async (req, res) => {
   }
 });
 
+// Catch-all for undefined /api routes so they always return JSON instead of HTML
+app.all('/api/*', (req, res) => {
+  res.status(404).json({ error: `API endpoint not found: ${req.method} ${req.originalUrl}` });
+});
+
+// Global JSON error handler (handles PayloadTooLargeError, invalid JSON, etc.)
+app.use((err, req, res, next) => {
+  console.error('Unhandled server error:', err);
+  const status = err.status || err.statusCode || 500;
+  res.status(status).json({
+    error: err.message || 'Internal Server Error',
+    code: err.code || 'SERVER_ERROR'
+  });
+});
+
 app.listen(PORT, () => {
   console.log(`=========================================`);
   console.log(`AttendanceX Server running on http://localhost:${PORT}`);
   console.log(`Connected to SQLite Database: attendancex.db`);
   console.log(`=========================================`);
 });
+
