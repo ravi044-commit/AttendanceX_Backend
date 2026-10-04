@@ -1,3 +1,11 @@
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
@@ -145,7 +153,7 @@ app.post('/api/auth/login', async (req, res) => {
         validPassword = true;
       }
     }
-    
+
     if (!validPassword) {
       return res.status(401).json({ error: 'Invalid password' });
     }
@@ -1368,6 +1376,170 @@ app.get('/api/department/stats', async (req, res) => {
   } catch (error) {
     console.error('Department stats error:', error);
     res.status(500).json({ error: 'Failed to retrieve department stats' });
+  }
+});
+
+/* ==========================================================================
+   DNN FACE RECOGNITION & ENROLLMENT SYSTEM
+   ========================================================================== */
+const getFaceDbPath = () => {
+  const envPath = process.env.FACE_DB_PATH;
+  if (!envPath) {
+    return path.resolve(__dirname, 'face_db');
+  }
+  return path.isAbsolute(envPath) ? envPath : path.resolve(__dirname, envPath);
+};
+
+// Clear cached embeddings so DNN model recalculates embeddings on new photos
+const refreshOrClearEmbeddingsCache = async (baseDir) => {
+  const deletedFiles = [];
+  try {
+    if (!fs.existsSync(baseDir)) return deletedFiles;
+    const entries = await fs.promises.readdir(baseDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isFile()) {
+        const name = entry.name.toLowerCase();
+        if (
+          name.startsWith('representations_') ||
+          name.includes('embedding') ||
+          name.includes('encoding') ||
+          name.endsWith('.pkl') ||
+          name.endsWith('.pickle') ||
+          name.endsWith('.npy')
+        ) {
+          const fullPath = path.join(baseDir, entry.name);
+          try {
+            await fs.promises.unlink(fullPath);
+            deletedFiles.push(fullPath);
+          } catch (e) {}
+        }
+      } else if (entry.isDirectory() && (entry.name === '.cache' || entry.name === 'cache')) {
+        const cacheDir = path.join(baseDir, entry.name);
+        try {
+          await fs.promises.rm(cacheDir, { recursive: true, force: true });
+          deletedFiles.push(cacheDir);
+        } catch (e) {}
+      }
+    }
+  } catch (err) {
+    console.error('Error clearing cached embeddings:', err);
+  }
+  return deletedFiles;
+};
+
+// POST /api/face/enroll: Saves <FACE_DB_PATH>/<uid>.jpg (for OpenCV SFace/YuNet) and <FACE_DB_PATH>/<uid>/<timestamp>.jpg
+app.post('/api/face/enroll', async (req, res) => {
+  try {
+    const { uid, image } = req.body || {};
+    if (!uid || typeof uid !== 'string' || !uid.trim()) {
+      return res.status(400).json({ error: 'Student UID is required' });
+    }
+    const cleanUid = uid.trim();
+    // Prevent path traversal
+    if (
+      cleanUid.includes('..') ||
+      cleanUid.includes('/') ||
+      cleanUid.includes('\\') ||
+      cleanUid.includes('\0') ||
+      !/^[a-zA-Z0-9_\-]+$/.test(cleanUid)
+    ) {
+      return res.status(400).json({ error: 'Invalid UID format' });
+    }
+    if (!image || typeof image !== 'string') {
+      return res.status(400).json({ error: 'Image data is required' });
+    }
+    let base64Data = image;
+    if (base64Data.includes(',')) {
+      base64Data = base64Data.split(',')[1];
+    }
+    const imageBuffer = Buffer.from(base64Data, 'base64');
+    if (!imageBuffer || imageBuffer.length === 0) {
+      return res.status(400).json({ error: 'Invalid image buffer' });
+    }
+    const baseDir = getFaceDbPath();
+    if (!fs.existsSync(baseDir)) {
+      await fs.promises.mkdir(baseDir, { recursive: true });
+    }
+    const targetDir = path.resolve(baseDir, cleanUid);
+    // Verify boundaries
+    const relative = path.relative(baseDir, targetDir);
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+      return res.status(400).json({ error: 'Path traversal detected in UID' });
+    }
+
+    // 1. Save directly into baseDir as <uid>.jpg so OpenCV DNN can load it immediately
+    const directModelPath = path.resolve(baseDir, `${cleanUid}.jpg`);
+    await fs.promises.writeFile(directModelPath, imageBuffer);
+
+    // 2. Also save into history subfolder <uid>/<timestamp>.jpg
+    await fs.promises.mkdir(targetDir, { recursive: true });
+    const timestamp = Date.now();
+    let filename = `${timestamp}.jpg`;
+    let filePath = path.join(targetDir, filename);
+    let counter = 1;
+    while (fs.existsSync(filePath)) {
+      filename = `${timestamp}_${counter++}.jpg`;
+      filePath = path.join(targetDir, filename);
+    }
+    await fs.promises.writeFile(filePath, imageBuffer);
+
+    // Clear cached embeddings so DNN recalculates
+    await refreshOrClearEmbeddingsCache(baseDir);
+
+    const subFiles = (await fs.promises.readdir(targetDir)).filter(f => /\.(jpe?g|png|webp|bmp)$/i.test(f));
+    const allPhotos = Array.from(new Set([`${cleanUid}.jpg`, ...subFiles])).sort();
+
+    return res.status(200).json({
+      success: true,
+      message: 'Face photo saved successfully',
+      uid: cleanUid,
+      filename: `${cleanUid}.jpg`,
+      photoCount: allPhotos.length,
+      savedPhotos: allPhotos
+    });
+  } catch (error) {
+    console.error('Face enrollment error:', error);
+    res.status(500).json({ error: error.message || 'Failed to save face photo' });
+  }
+});
+
+// GET /api/face/count/:uid
+app.get('/api/face/count/:uid', async (req, res) => {
+  try {
+    const { uid } = req.params;
+    if (!uid || !/^[a-zA-Z0-9_\-]+$/.test(uid.trim())) {
+      return res.status(400).json({ error: 'Invalid UID format' });
+    }
+    const cleanUid = uid.trim();
+    const baseDir = getFaceDbPath();
+    if (!fs.existsSync(baseDir)) {
+      return res.json({ uid: cleanUid, photoCount: 0, photos: [] });
+    }
+
+    const photos = [];
+    // Check direct file in baseDir (e.g. STU-COMP-052.jpg)
+    for (const ext of ['.jpg', '.jpeg', '.png', '.bmp']) {
+      const directFile = path.resolve(baseDir, `${cleanUid}${ext}`);
+      if (fs.existsSync(directFile)) {
+        photos.push(`${cleanUid}${ext}`);
+      }
+    }
+
+    // Check subfolder in baseDir (e.g. STU-COMP-052/...)
+    const targetDir = path.resolve(baseDir, cleanUid);
+    if (fs.existsSync(targetDir) && fs.statSync(targetDir).isDirectory()) {
+      const files = await fs.promises.readdir(targetDir);
+      const subPhotos = files.filter(f => /\.(jpe?g|png|webp|bmp)$/i.test(f));
+      for (const sp of subPhotos) {
+        if (!photos.includes(sp)) {
+          photos.push(sp);
+        }
+      }
+    }
+
+    return res.json({ uid: cleanUid, photoCount: photos.length, photos: photos.sort() });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to retrieve face count' });
   }
 });
 
