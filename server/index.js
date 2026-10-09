@@ -21,6 +21,14 @@ import {
   calculateWeightedScore,
   getStudentBatch
 } from './database.js';
+import {
+  requestOtp,
+  verifyOtp,
+  issuePasswordResetAuthorization,
+  resetPasswordWithAuthorization,
+  finalizeEmailChange,
+  finalizeAccountSetup
+} from './otpService.js';
 
 dotenv.config();
 
@@ -119,14 +127,25 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(400).json({ error: 'Email and password are required' });
     }
 
-    let query = 'SELECT * FROM users WHERE LOWER(email) = LOWER(?)';
-    const params = [email.trim()];
+    const identifier = email.trim();
+    let query = `
+      SELECT u.* FROM users u
+      LEFT JOIN students s ON (s.user_id = u.id OR s.uid = u.uid)
+      WHERE (
+        LOWER(u.email) = LOWER(?)
+        OR LOWER(u.uid) = LOWER(?)
+        OR LOWER(u.email) = LOWER(? || '@attendancex.edu')
+        OR s.enrolment_number = ?
+      )
+    `;
+    const params = [identifier, identifier, identifier, identifier];
 
     // If role is specified, verify matching role
     if (role) {
-      query += ' AND role = ?';
+      query += ' AND u.role = ?';
       params.push(role);
     }
+    query += ' LIMIT 1';
 
     const user = await getQuery(query, params);
 
@@ -199,6 +218,233 @@ app.post('/api/auth/register', async (req, res) => {
     error: 'Public registration is disabled. Administrator, Faculty, Student, and HOD accounts are institutional and strictly managed via internal Administration.'
   });
 });
+
+/* ==========================================================================
+   FEATURE 6: EMAIL OTP VERIFICATION & PASSWORD RECOVERY ENDPOINTS
+   ========================================================================== */
+
+// 1. Send / Resend OTP
+app.post('/api/auth/otp/send', async (req, res) => {
+  try {
+    const { email, purpose } = req.body;
+
+    if (!email || !purpose) {
+      return res.status(400).json({ error: 'Email and purpose are required' });
+    }
+
+    let userId = null;
+    if (purpose === 'email_change') {
+      const authHeader = req.headers['authorization'];
+      const token = authHeader && authHeader.split(' ')[1];
+      if (token) {
+        try {
+          const decoded = jwt.verify(token, JWT_SECRET);
+          userId = decoded.id;
+        } catch {
+          // Token expired or secret updated
+        }
+      }
+
+      // Robust fallback: resolve user by current account email, enrollment, or UID if token was not sent
+      if (!userId && (req.body.currentEmail || req.body.uid)) {
+        const lookup = (req.body.currentEmail || req.body.uid).trim();
+        const foundUser = await getQuery(`
+          SELECT u.id FROM users u
+          LEFT JOIN students s ON (s.user_id = u.id OR s.uid = u.uid)
+          WHERE LOWER(u.email) = LOWER(?) 
+             OR LOWER(u.uid) = LOWER(?) 
+             OR s.enrolment_number = ?
+             OR LOWER(u.email) = LOWER(? || '@attendancex.edu')
+          LIMIT 1
+        `, [lookup, lookup, lookup, lookup]);
+        if (foundUser) userId = foundUser.id;
+      }
+
+      if (!userId) {
+        return res.status(401).json({ error: 'Authentication required. Please ensure you are logged into your account.' });
+      }
+    }
+
+    const result = await requestOtp({ email, purpose, userId });
+    // Secure response: Never exposes OTP
+    res.json(result);
+  } catch (error) {
+    const msg = error.message || 'Failed to process verification code request';
+    if (msg.includes('wait') && msg.includes('seconds')) {
+      return res.status(429).json({ error: msg });
+    }
+    if (msg.includes('No registered account')) {
+      return res.status(404).json({ error: msg });
+    }
+    if (msg.includes('Email delivery failed') || msg.includes('SMTP')) {
+      return res.status(502).json({ error: msg });
+    }
+    res.status(400).json({ error: msg });
+  }
+});
+
+// 2. Verify OTP (General & Password Recovery)
+app.post('/api/auth/otp/verify', async (req, res) => {
+  try {
+    const { email, otp, purpose } = req.body;
+
+    if (!email || !otp || !purpose) {
+      return res.status(400).json({ error: 'Email, verification code, and purpose are required' });
+    }
+
+    let userId = null;
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (token) {
+      try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        userId = decoded.id;
+      } catch {
+        // Proceed without user id if token expired
+      }
+    }
+
+    await verifyOtp({ email, otp, purpose, userId });
+
+    // If purpose is password recovery, issue short-lived single-use authorization token
+    if (purpose === 'password_recovery') {
+      const authResult = await issuePasswordResetAuthorization({ email });
+      return res.json({
+        success: true,
+        message: 'Verification code verified successfully',
+        purpose,
+        resetAuthorization: authResult.resetAuthorization,
+        expiresInSeconds: authResult.expiresInSeconds
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Verification code verified successfully',
+      purpose
+    });
+  } catch (error) {
+    const msg = error.message || 'OTP verification failed';
+    if (msg.includes('Maximum') || msg.includes('attempts')) {
+      return res.status(400).json({ error: msg });
+    }
+    res.status(400).json({ error: msg });
+  }
+});
+
+// 3. Reset Password using Authorization Token
+app.post('/api/auth/reset-password', async (req, res) => {
+  try {
+    const { resetAuthorization, newPassword } = req.body;
+
+    if (!resetAuthorization || !newPassword) {
+      return res.status(400).json({ error: 'Reset authorization token and new password are required' });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters long' });
+    }
+
+    const result = await resetPasswordWithAuthorization({ resetAuthorization, newPassword });
+    res.json(result);
+  } catch (error) {
+    res.status(400).json({ error: error.message || 'Failed to reset password' });
+  }
+});
+
+// 4. Verify & Finalize Email Change
+app.post('/api/auth/otp/verify-email-change', async (req, res) => {
+  try {
+    const { newEmail, otp, currentEmail, uid } = req.body;
+
+    if (!newEmail || !otp) {
+      return res.status(400).json({ error: 'New email address and verification code are required' });
+    }
+
+    let userId = null;
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (token) {
+      try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        userId = decoded.id;
+      } catch {}
+    }
+
+    if (!userId && (currentEmail || uid)) {
+      const lookup = (currentEmail || uid).trim();
+      const foundUser = await getQuery(`
+        SELECT u.id FROM users u
+        LEFT JOIN students s ON (s.user_id = u.id OR s.uid = u.uid)
+        WHERE LOWER(u.email) = LOWER(?) 
+           OR LOWER(u.uid) = LOWER(?) 
+           OR s.enrolment_number = ?
+           OR LOWER(u.email) = LOWER(? || '@attendancex.edu')
+        LIMIT 1
+      `, [lookup, lookup, lookup, lookup]);
+      if (foundUser) userId = foundUser.id;
+    }
+
+    if (!userId) {
+      return res.status(401).json({ error: 'Authentication required for email change verification' });
+    }
+
+    const result = await finalizeEmailChange({
+      userId,
+      newEmail,
+      otp
+    });
+
+    // Generate refreshed JWT token with updated email
+    const updatedUser = await getQuery('SELECT id, uid, name, email, role, department, phone, avatar FROM users WHERE id = ?', [userId]);
+    const newToken = jwt.sign(
+      { id: updatedUser.id, uid: updatedUser.uid, role: updatedUser.role, email: updatedUser.email, name: updatedUser.name, department: updatedUser.department },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    res.json({
+      success: true,
+      message: result.message,
+      user: updatedUser,
+      token: newToken
+    });
+  } catch (error) {
+    res.status(400).json({ error: error.message || 'Email change verification failed' });
+  }
+});
+
+// 5. Verify & Finalize Initial Account Setup
+app.post('/api/auth/otp/verify-account-setup', async (req, res) => {
+  try {
+    const { email, otp, password } = req.body;
+
+    if (!email || !otp || !password) {
+      return res.status(400).json({ error: 'Email, verification code, and password are required' });
+    }
+
+    const result = await finalizeAccountSetup({ email, otp, password });
+    res.json(result);
+  } catch (error) {
+    res.status(400).json({ error: error.message || 'Account setup verification failed' });
+  }
+});
+
+// 6. Get Current User Profile (Me)
+app.get('/api/auth/me', authenticateToken, async (req, res) => {
+  try {
+    const user = await getQuery('SELECT id, uid, name, email, role, department, phone, avatar, setup_status FROM users WHERE id = ?', [req.user.id]);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    let studentData = null;
+    if (user.role === 'student') {
+      studentData = await getQuery('SELECT * FROM students WHERE uid = ? OR user_id = ?', [user.uid, user.id]);
+    }
+    res.json({ ...user, studentData });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 /* ==========================================================================
    STUDENTS ENDPOINTS

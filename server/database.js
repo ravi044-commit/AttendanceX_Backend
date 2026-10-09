@@ -298,6 +298,69 @@ export const initDatabase = async () => {
     console.warn('Could not update student divisions:', err.message);
   }
 
+  // Create Email OTP Verifications table
+  await runQuery(`
+    CREATE TABLE IF NOT EXISTS email_otps (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER,
+      email TEXT NOT NULL,
+      purpose TEXT NOT NULL CHECK(purpose IN ('account_setup', 'email_change', 'password_recovery')),
+      otp_code TEXT,
+      otp_hash TEXT NOT NULL,
+      salt TEXT NOT NULL,
+      expires_at DATETIME NOT NULL,
+      attempts INTEGER DEFAULT 0,
+      max_attempts INTEGER DEFAULT 5,
+      is_used INTEGER DEFAULT 0,
+      resend_count INTEGER DEFAULT 0,
+      last_sent_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+  `);
+  await runQuery(`CREATE INDEX IF NOT EXISTS idx_email_otps_lookup ON email_otps(email, purpose, is_used)`);
+
+  // Ensure otp_code column exists on email_otps table
+  try {
+    const otpsTableInfo = await allQuery(`PRAGMA table_info(email_otps)`);
+    const hasOtpCode = otpsTableInfo.some((col) => col.name === 'otp_code');
+    if (!hasOtpCode) {
+      await runQuery(`ALTER TABLE email_otps ADD COLUMN otp_code TEXT`);
+    }
+  } catch (err) {
+    console.warn('Could not verify/add otp_code column to email_otps table:', err.message);
+  }
+
+  // Create Password Reset Authorizations table
+  await runQuery(`
+    CREATE TABLE IF NOT EXISTS password_reset_authorizations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      token_hash TEXT UNIQUE NOT NULL,
+      user_id INTEGER NOT NULL,
+      email TEXT NOT NULL,
+      expires_at DATETIME NOT NULL,
+      is_used INTEGER DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+  `);
+  await runQuery(`CREATE INDEX IF NOT EXISTS idx_password_reset_token ON password_reset_authorizations(token_hash)`);
+
+  // Ensure setup_status and email_verified_at columns exist on users table
+  try {
+    const userTableInfo = await allQuery(`PRAGMA table_info(users)`);
+    const hasSetupStatus = userTableInfo.some((col) => col.name === 'setup_status');
+    if (!hasSetupStatus) {
+      await runQuery(`ALTER TABLE users ADD COLUMN setup_status TEXT DEFAULT 'completed'`);
+    }
+    const hasEmailVerifiedAt = userTableInfo.some((col) => col.name === 'email_verified_at');
+    if (!hasEmailVerifiedAt) {
+      await runQuery(`ALTER TABLE users ADD COLUMN email_verified_at DATETIME`);
+    }
+  } catch (err) {
+    console.warn('Could not verify/add setup columns to users table:', err.message);
+  }
+
   // Seed default data if users table is empty
   const userCount = await getQuery(`SELECT COUNT(*) as count FROM users`);
   if (userCount && userCount.count === 0) {

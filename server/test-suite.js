@@ -210,6 +210,18 @@ async function runTestSuite() {
     assert(false, `Subject attendance test failed: ${err.message}`);
   }
 
+  // TEST SUITE 7: Feature 6 Email OTP Verification & Account Security
+  console.log('\n--- TEST GROUP 7: Feature 6 Email OTP Verification ---');
+  try {
+    const { runOtpTestSuite } = await import('./test-otp-flow.js');
+    const otpResults = await runOtpTestSuite();
+    totalTests += otpResults.total;
+    passedTests += otpResults.passed;
+    assert(otpResults.passed === otpResults.total, `All ${otpResults.total} Email OTP security tests passed!`);
+  } catch (err) {
+    assert(false, `OTP test suite failed: ${err.message}`);
+  }
+
   console.log('\n====================================================');
   console.log(`TEST RUN FINISHED: ${passedTests}/${totalTests} Passed (${failedTests} Failed)`);
   console.log('====================================================\n');
