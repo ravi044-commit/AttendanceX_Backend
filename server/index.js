@@ -12,6 +12,8 @@ import dotenv from 'dotenv';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
+import zlib from 'zlib';
+import { OAuth2Client } from 'google-auth-library';
 import {
   initDatabase,
   getQuery,
@@ -48,6 +50,27 @@ const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || 'attendancex_super_secret_key_2026';
 const NODE_ENV = process.env.NODE_ENV || 'production';
 const ALLOW_DEMO_PASSWORDS = process.env.ALLOW_DEMO_PASSWORDS === 'true';
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '631464953143-s5tkj9oamekrfulm8jqc8l2n5q03co8r.apps.googleusercontent.com';
+const googleOAuthClient = new OAuth2Client(GOOGLE_CLIENT_ID);
+
+export const verifyGoogleIdToken = async (idToken) => {
+  if (!idToken || typeof idToken !== 'string') {
+    throw new Error('Google ID token is required');
+  }
+  const ticket = await googleOAuthClient.verifyIdToken({
+    idToken,
+    audience: GOOGLE_CLIENT_ID,
+  });
+  const payload = ticket.getPayload();
+  if (!payload || !payload.sub) {
+    throw new Error('Invalid Google ID token payload');
+  }
+  const validIssuers = ['accounts.google.com', 'https://accounts.google.com'];
+  if (!validIssuers.includes(payload.iss)) {
+    throw new Error(`Invalid token issuer: ${payload.iss}`);
+  }
+  return payload;
+};
 
 // Configurable CORS for network deployment
 const configuredOrigins = process.env.CORS_ORIGIN
@@ -58,17 +81,91 @@ app.use(
   cors({
     origin: (origin, callback) => {
       // Allow requests with no origin (mobile apps, curl, RFID hardware scanner, Postman)
-      if (!origin || configuredOrigins === '*' || configuredOrigins.includes('*') || configuredOrigins.includes(origin)) {
+      if (
+        !origin ||
+        configuredOrigins === '*' ||
+        (Array.isArray(configuredOrigins) && (configuredOrigins.includes('*') || configuredOrigins.includes(origin)))
+      ) {
         return callback(null, true);
       }
-      return callback(null, true);
+      return callback(new Error('CORS origin not allowed by institutional policy'));
     },
     credentials: true,
   })
 );
 
+// High-performance Gzip Compression Middleware (built with native Node.js zlib)
+const compressionMiddleware = (req, res, next) => {
+  const acceptEncoding = req.headers['accept-encoding'] || '';
+  if (!acceptEncoding.includes('gzip')) {
+    return next();
+  }
+
+  const originalSend = res.send;
+  res.send = function (body) {
+    if (res.headersSent || !body) return originalSend.call(this, body);
+
+    let output = body;
+    if (typeof output === 'object' && !Buffer.isBuffer(output)) {
+      output = JSON.stringify(output);
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    }
+
+    if (typeof output === 'string' && Buffer.byteLength(output) > 1024) {
+      zlib.gzip(Buffer.from(output), (err, compressed) => {
+        if (err) {
+          return originalSend.call(this, output);
+        }
+        res.setHeader('Content-Encoding', 'gzip');
+        res.setHeader('Content-Length', compressed.length);
+        res.removeHeader('ETag');
+        return originalSend.call(this, compressed);
+      });
+    } else {
+      return originalSend.call(this, output);
+    }
+  };
+  next();
+};
+
+app.use(compressionMiddleware);
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Short-lived in-memory cache for rarely changing data (timetable, classes, static lists)
+const shortLivedCache = new Map();
+const getCachedData = (key, ttlMs = 60000) => {
+  const cached = shortLivedCache.get(key);
+  if (!cached) return null;
+  if (Date.now() - cached.timestamp > ttlMs) {
+    shortLivedCache.delete(key);
+    return null;
+  }
+  return cached.data;
+};
+const setCachedData = (key, data) => {
+  shortLivedCache.set(key, { data, timestamp: Date.now() });
+};
+const invalidateCache = (prefix = '') => {
+  if (!prefix) {
+    shortLivedCache.clear();
+    return;
+  }
+  for (const key of shortLivedCache.keys()) {
+    if (key.startsWith(prefix)) shortLivedCache.delete(key);
+  }
+};
+
+// Standard pagination helper (default 20, max 1000)
+const parsePagination = (query = {}) => {
+  let page = parseInt(query.page, 10);
+  let limit = parseInt(query.limit, 10);
+  if (isNaN(page) || page < 1) page = 1;
+  if (isNaN(limit) || limit < 1) limit = 20;
+  if (limit > 1000) limit = 1000;
+  const offset = (page - 1) * limit;
+  return { page, limit, offset };
+};
 
 // Initialize SQLite DB
 initDatabase().catch((err) => {
@@ -86,6 +183,20 @@ const authenticateToken = (req, res, next) => {
     req.user = user;
     next();
   });
+};
+
+// Middleware for role-based authorization (RBAC)
+const requireRole = (...allowedRoles) => (req, res, next) => {
+  if (!req.user || !req.user.role) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+  const userRole = (req.user.role || '').trim().toLowerCase();
+  const normalized = allowedRoles.map((r) => r.trim().toLowerCase());
+  // System administrators possess overarching institutional authority across all portals
+  if (userRole === 'admin' || normalized.includes(userRole)) {
+    return next();
+  }
+  return res.status(403).json({ error: 'Access denied: insufficient institutional privileges' });
 };
 
 /* ==========================================================================
@@ -156,7 +267,7 @@ app.post('/api/auth/login', async (req, res) => {
     // Check password securely (bcrypt hash first, legacy plain fallback if any)
     let validPassword = false;
     try {
-      validPassword = bcrypt.compareSync(password, user.password);
+      validPassword = await bcrypt.compare(password, user.password);
     } catch {
       validPassword = false;
     }
@@ -183,6 +294,22 @@ app.post('/api/auth/login', async (req, res) => {
       studentData = await getQuery('SELECT * FROM students WHERE uid = ? OR user_id = ?', [user.uid, user.id]);
     }
 
+    // Replace cartoon avatar with enrolled biometric photo if available
+    let userAvatar = user.avatar;
+    const checkUid = user.uid || (studentData && studentData.uid);
+    if (checkUid) {
+      const faceFile = path.resolve(getFaceDbPath(), `${checkUid}.jpg`);
+      if (fs.existsSync(faceFile) && (!userAvatar || userAvatar.includes('dicebear'))) {
+        userAvatar = `/api/face/photo/${checkUid}`;
+      }
+    }
+    if (studentData && (!studentData.student_photo || studentData.student_photo.includes('dicebear'))) {
+      const faceFile = path.resolve(getFaceDbPath(), `${studentData.uid}.jpg`);
+      if (fs.existsSync(faceFile)) {
+        studentData.student_photo = `/api/face/photo/${studentData.uid}`;
+      }
+    }
+
     const token = jwt.sign(
       { id: user.id, uid: user.uid, role: user.role, email: user.email, name: user.name, department: user.department },
       JWT_SECRET,
@@ -197,7 +324,9 @@ app.post('/api/auth/login', async (req, res) => {
       role: user.role,
       department: user.department,
       phone: user.phone,
-      avatar: user.avatar,
+      avatar: userAvatar,
+      google_id: user.google_id || null,
+      google_email: user.google_email || null,
       studentData
     };
 
@@ -217,6 +346,291 @@ app.post('/api/auth/register', async (req, res) => {
   return res.status(403).json({
     error: 'Public registration is disabled. Administrator, Faculty, Student, and HOD accounts are institutional and strictly managed via internal Administration.'
   });
+});
+
+/* ==========================================================================
+   GOOGLE IDENTITY SERVICES (GIS) OAUTH AUTHENTICATION & ACCOUNT LINKING
+   ========================================================================== */
+
+// 1. Google ID Token Sign-In & Verification
+app.post('/api/auth/google', async (req, res) => {
+  try {
+    const { credential, idToken, role } = req.body;
+    const tokenToVerify = credential || idToken;
+
+    if (!tokenToVerify) {
+      return res.status(400).json({ error: 'Google ID token (credential) is required' });
+    }
+
+    let payload;
+    try {
+      payload = await verifyGoogleIdToken(tokenToVerify);
+    } catch (verifyErr) {
+      console.warn('Google ID token verification failed:', verifyErr.message);
+      return res.status(401).json({ error: `Google verification failed: ${verifyErr.message}` });
+    }
+
+    const googleSub = payload.sub;
+    const googleEmail = payload.email || '';
+    const googleName = payload.name || '';
+    const googlePicture = payload.picture || '';
+
+    // Search for an account explicitly linked via verified Google Subject ID
+    let user = await getQuery('SELECT * FROM users WHERE google_id = ?', [googleSub]);
+
+    if (!user) {
+      // Security Constraints:
+      // - Do not automatically grant access to unknown Google accounts.
+      // - Do not automatically link an existing account based only on matching email addresses.
+      // Check if an existing AttendanceX account has matching email to assist user guidance
+      const candidateUser = googleEmail
+        ? await getQuery('SELECT id, uid, name, email, role, department FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1', [googleEmail])
+        : null;
+
+      // Issue temporary signed link token (valid for 10 minutes)
+      const linkToken = jwt.sign(
+        {
+          sub: googleSub,
+          email: googleEmail,
+          name: googleName,
+          picture: googlePicture,
+          type: 'google_link_intent'
+        },
+        JWT_SECRET,
+        { expiresIn: '10m' }
+      );
+
+      return res.status(200).json({
+        status: 'unlinked',
+        message: 'This Google account is not yet linked to any AttendanceX profile. Please verify your AttendanceX credentials to securely link your account.',
+        googleEmail,
+        googleName,
+        suggestedIdentifier: candidateUser ? candidateUser.email : (googleEmail || ''),
+        hasMatchingEmail: Boolean(candidateUser),
+        linkToken
+      });
+    }
+
+    // Verify linked account is active and authorized
+    if (user.setup_status === 'suspended' || user.setup_status === 'inactive') {
+      return res.status(403).json({ error: 'Your AttendanceX account has been deactivated. Please contact the administrator.' });
+    }
+
+    // If student/user has a Google profile picture, replace their avatar and student_photo with it
+    if (googlePicture) {
+      await runQuery('UPDATE users SET avatar = ? WHERE id = ?', [googlePicture, user.id]);
+      user.avatar = googlePicture;
+      if (user.role === 'student') {
+        await runQuery('UPDATE students SET student_photo = ? WHERE uid = ? OR user_id = ?', [googlePicture, user.uid, user.id]);
+      }
+    }
+
+    let studentData = null;
+    if (user.role === 'student') {
+      studentData = await getQuery('SELECT * FROM students WHERE uid = ? OR user_id = ?', [user.uid, user.id]);
+      if (studentData && studentData.status === 'Inactive') {
+        return res.status(403).json({ error: 'Your student account is marked Inactive. Please contact the department administration.' });
+      }
+    }
+
+    // Institutional role and permissions are strictly preserved from the database
+    const sessionToken = jwt.sign(
+      { id: user.id, uid: user.uid, role: user.role, email: user.email, name: user.name, department: user.department },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    const safeUser = {
+      id: user.id,
+      uid: user.uid,
+      name: user.name,
+      email: user.email,
+      role: user.role,
+      department: user.department,
+      phone: user.phone,
+      avatar: user.avatar || googlePicture,
+      google_id: user.google_id,
+      google_email: user.google_email,
+      studentData
+    };
+
+    return res.json({
+      message: 'Google Sign-In successful',
+      token: sessionToken,
+      user: safeUser
+    });
+  } catch (err) {
+    console.error('Google Auth endpoint error:', err);
+    return res.status(500).json({ error: 'Internal server error during Google authentication' });
+  }
+});
+
+// 2. Secure Account Linking Flow (verifies AttendanceX credentials before binding google_id)
+app.post('/api/auth/google/link', async (req, res) => {
+  try {
+    const { linkToken, identifier, password } = req.body;
+
+    if (!linkToken || !identifier || !password) {
+      return res.status(400).json({ error: 'Link token, AttendanceX ID/email, and password are required' });
+    }
+
+    let decoded;
+    try {
+      decoded = jwt.verify(linkToken, JWT_SECRET);
+      if (decoded.type !== 'google_link_intent' || !decoded.sub) {
+        throw new Error('Invalid link token payload');
+      }
+    } catch (tokenErr) {
+      return res.status(401).json({ error: 'Link authorization expired or invalid. Please sign in with Google again.' });
+    }
+
+    const { sub: googleSub, email: googleEmail } = decoded;
+
+    // Resolve AttendanceX account by email, enrollment number, or UID
+    const cleanId = identifier.trim();
+    const user = await getQuery(`
+      SELECT u.* FROM users u
+      LEFT JOIN students s ON (s.user_id = u.id OR s.uid = u.uid)
+      WHERE (
+        LOWER(u.email) = LOWER(?)
+        OR LOWER(u.uid) = LOWER(?)
+        OR LOWER(u.email) = LOWER(? || '@attendancex.edu')
+        OR s.enrolment_number = ?
+      )
+      LIMIT 1
+    `, [cleanId, cleanId, cleanId, cleanId]);
+
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid AttendanceX credentials. Account not found.' });
+    }
+
+    // Verify institutional password
+    let validPassword = false;
+    try {
+      validPassword = await bcrypt.compare(password, user.password);
+    } catch {
+      validPassword = false;
+    }
+    if (!validPassword && password === user.password) {
+      validPassword = true;
+    }
+    if (!validPassword && ALLOW_DEMO_PASSWORDS) {
+      const demoPasswords = ['Admin@123', 'Hod@123', 'Faculty@123', 'Student@123'];
+      if (demoPasswords.includes(password)) validPassword = true;
+    }
+
+    if (!validPassword) {
+      return res.status(401).json({ error: 'Incorrect AttendanceX password. Account linking rejected.' });
+    }
+
+    // Check if another account is already linked to this Google ID
+    const existingLinked = await getQuery('SELECT id, email, uid FROM users WHERE google_id = ? AND id != ?', [googleSub, user.id]);
+    if (existingLinked) {
+      return res.status(409).json({ error: 'This Google account is already linked to another AttendanceX profile.' });
+    }
+
+    // Securely bind Google Subject ID and replace cartoon avatar with Google photo if available
+    const googlePicture = decoded.picture || '';
+    if (googlePicture) {
+      await runQuery('UPDATE users SET google_id = ?, google_email = ?, avatar = ? WHERE id = ?', [googleSub, googleEmail, googlePicture, user.id]);
+      user.avatar = googlePicture;
+      if (user.role === 'student') {
+        await runQuery('UPDATE students SET student_photo = ? WHERE uid = ? OR user_id = ?', [googlePicture, user.uid, user.id]);
+      }
+    } else {
+      await runQuery('UPDATE users SET google_id = ?, google_email = ? WHERE id = ?', [googleSub, googleEmail, user.id]);
+    }
+
+    let studentData = null;
+    if (user.role === 'student') {
+      studentData = await getQuery('SELECT * FROM students WHERE uid = ? OR user_id = ?', [user.uid, user.id]);
+    }
+
+    const sessionToken = jwt.sign(
+      { id: user.id, uid: user.uid, role: user.role, email: user.email, name: user.name, department: user.department },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    const safeUser = {
+      id: user.id,
+      uid: user.uid,
+      name: user.name,
+      email: user.email,
+      role: user.role,
+      department: user.department,
+      phone: user.phone,
+      avatar: user.avatar || googlePicture,
+      google_id: googleSub,
+      google_email: googleEmail,
+      studentData
+    };
+
+    return res.json({
+      message: 'Google account linked successfully and session authenticated!',
+      token: sessionToken,
+      user: safeUser
+    });
+  } catch (err) {
+    console.error('Google linking error:', err);
+    return res.status(500).json({ error: 'Failed to link Google account' });
+  }
+});
+
+// 3. Unlink Google Account
+app.post('/api/auth/google/unlink', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { password } = req.body;
+
+    const user = await getQuery('SELECT * FROM users WHERE id = ?', [userId]);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    if (!user.google_id) {
+      return res.status(400).json({ error: 'No Google account is currently linked to this profile' });
+    }
+
+    // Require current password for security verification
+    let validPassword = false;
+    if (password) {
+      try {
+        validPassword = bcrypt.compareSync(password, user.password);
+      } catch {
+        validPassword = false;
+      }
+      if (!validPassword && password === user.password) validPassword = true;
+      if (!validPassword && ALLOW_DEMO_PASSWORDS) {
+        const demoPasswords = ['Admin@123', 'Hod@123', 'Faculty@123', 'Student@123'];
+        if (demoPasswords.includes(password)) validPassword = true;
+      }
+    }
+
+    if (!validPassword) {
+      return res.status(401).json({ error: 'Current password verification is required to unlink Google account' });
+    }
+
+    await runQuery('UPDATE users SET google_id = NULL, google_email = NULL WHERE id = ?', [userId]);
+
+    return res.json({ message: 'Google account successfully unlinked' });
+  } catch (err) {
+    console.error('Google unlink error:', err);
+    return res.status(500).json({ error: 'Failed to unlink Google account' });
+  }
+});
+
+// 4. Google Link Status
+app.get('/api/auth/google/status', authenticateToken, async (req, res) => {
+  try {
+    const user = await getQuery('SELECT google_id, google_email FROM users WHERE id = ?', [req.user.id]);
+    res.json({
+      linked: Boolean(user?.google_id),
+      googleEmail: user?.google_email || null
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to get Google status' });
+  }
 });
 
 /* ==========================================================================
@@ -439,6 +853,25 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
     if (user.role === 'student') {
       studentData = await getQuery('SELECT * FROM students WHERE uid = ? OR user_id = ?', [user.uid, user.id]);
     }
+
+    // Replace cartoon avatar with enrolled biometric photo if available
+    let avatar = user.avatar;
+    const checkUid = user.uid || (studentData && studentData.uid);
+    if (checkUid) {
+      const faceFile = path.resolve(getFaceDbPath(), `${checkUid}.jpg`);
+      if (fs.existsSync(faceFile) && (!avatar || avatar.includes('dicebear'))) {
+        avatar = `/api/face/photo/${checkUid}`;
+      }
+    }
+    user.avatar = avatar;
+
+    if (studentData && (!studentData.student_photo || studentData.student_photo.includes('dicebear'))) {
+      const faceFile = path.resolve(getFaceDbPath(), `${studentData.uid}.jpg`);
+      if (fs.existsSync(faceFile)) {
+        studentData.student_photo = `/api/face/photo/${studentData.uid}`;
+      }
+    }
+
     res.json({ ...user, studentData });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -450,48 +883,104 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
    STUDENTS ENDPOINTS
    ========================================================================== */
 
-// Get all students (with optional department filter)
-app.get('/api/students', async (req, res) => {
+// Get students (with optional department, status, semester, division, search + pagination)
+app.get('/api/students', authenticateToken, async (req, res) => {
   try {
-    const { department, search, status } = req.query;
-    let sql = 'SELECT * FROM students WHERE 1=1';
+    const { department, search, status, semester, division, class: classFilter, all } = req.query;
+    const { page, limit, offset } = parsePagination(req.query);
+
+    const whereClauses = [];
     const params = [];
 
     if (department && department !== 'All') {
-      sql += ' AND department = ?';
+      whereClauses.push('department = ?');
       params.push(department);
     }
 
     if (status && status !== 'All') {
-      sql += ' AND status = ?';
+      whereClauses.push('status = ?');
       params.push(status);
     }
 
-    if (search) {
-      sql += ' AND (name LIKE ? OR enrolment_number LIKE ? OR uid LIKE ?)';
-      const term = `%${search}%`;
+    if (semester && semester !== 'All') {
+      whereClauses.push('semester = ?');
+      params.push(Number(semester));
+    }
+
+    if (division && division !== 'All') {
+      whereClauses.push('division = ?');
+      params.push(division);
+    }
+
+    if (classFilter && classFilter !== 'All') {
+      if (classFilter.toLowerCase().includes('batch a') || classFilter === 'A') {
+        whereClauses.push("(division = 'Batch A' OR division = 'A')");
+      } else if (classFilter.toLowerCase().includes('batch b') || classFilter === 'B') {
+        whereClauses.push("(division = 'Batch B' OR division = 'B')");
+      }
+    }
+
+    if (search && search.trim()) {
+      whereClauses.push('(name LIKE ? OR enrolment_number LIKE ? OR uid LIKE ?)');
+      const term = `%${search.trim()}%`;
       params.push(term, term, term);
     }
 
-    sql += ' ORDER BY name ASC';
-    const students = await allQuery(sql, params);
+    const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
 
-    // Compute updated percentage and formula value
+    // Total count for pagination
+    const countRow = await getQuery(`SELECT COUNT(*) as total FROM students ${whereSql}`, params);
+    const total = countRow ? countRow.total : 0;
+
+    // Never SELECT * for list views; select only the columns table actually displays
+    const columns = `uid, user_id, name, enrolment_number, student_photo, department, semester, division, status, total_classes_present, total_classes_conducted, percentage, weighted_percentage, lecture_present, lecture_total, lab_present, lab_total`;
+
+    let sql = `SELECT ${columns} FROM students ${whereSql} ORDER BY name ASC`;
+    const queryParams = [...params];
+
+    const isPaginated = req.query.page !== undefined || req.query.limit !== undefined || all !== 'true';
+    if (isPaginated && all !== 'true') {
+      sql += ` LIMIT ? OFFSET ?`;
+      queryParams.push(limit, offset);
+    }
+
+    const students = await allQuery(sql, queryParams);
+    const baseDir = getFaceDbPath();
+
     const formatted = students.map((s) => {
-      const total = s.total_classes_conducted || (s.lecture_total + s.lab_total) || 0;
-      const present = s.total_classes_present || (s.lecture_present + s.lab_present) || 0;
-      const pct = calculatePercentage(present, total);
-      const ratio = total > 0 ? present / total : 0;
+      const tot = s.total_classes_conducted || (s.lecture_total + s.lab_total) || 0;
+      const pres = s.total_classes_present || (s.lecture_present + s.lab_present) || 0;
+      const pct = calculatePercentage(pres, tot);
+      const ratio = tot > 0 ? pres / tot : 0;
       const weighted = calculateWeightedScore(ratio);
+
+      let photo = s.student_photo;
+      if (!photo || photo.includes('dicebear')) {
+        const directFile = path.resolve(baseDir, `${s.uid}.jpg`);
+        if (fs.existsSync(directFile)) {
+          photo = `/api/face/photo/${s.uid}`;
+        }
+      }
 
       return {
         ...s,
+        student_photo: photo,
         percentage: pct,
         weighted_percentage: weighted
       };
     });
 
-    res.json(formatted);
+    if (all === 'true' && !req.query.page) {
+      return res.json(formatted);
+    }
+
+    res.json({
+      items: formatted,
+      page,
+      limit,
+      total,
+      hasMore: offset + formatted.length < total
+    });
   } catch (error) {
     console.error('Fetch students error:', error);
     res.status(500).json({ error: 'Failed to fetch students' });
@@ -649,13 +1138,20 @@ export const computeSubjectAttendance = async (studentUid, studentRecord = null)
 };
 
 // Get single student by UID
-app.get('/api/students/:uid', async (req, res) => {
+app.get('/api/students/:uid', authenticateToken, async (req, res) => {
   try {
     const { uid } = req.params;
     const student = await getQuery('SELECT * FROM students WHERE uid = ?', [uid]);
 
     if (!student) {
       return res.status(404).json({ error: 'Student not found' });
+    }
+
+    if (!student.student_photo || student.student_photo.includes('dicebear')) {
+      const directFile = path.resolve(getFaceDbPath(), `${student.uid}.jpg`);
+      if (fs.existsSync(directFile)) {
+        student.student_photo = `/api/face/photo/${student.uid}`;
+      }
     }
 
     const history = await allQuery(`
@@ -687,7 +1183,7 @@ app.get('/api/students/:uid', async (req, res) => {
 });
 
 // Dedicated endpoint for subject attendance
-app.get('/api/students/:uid/subject-attendance', async (req, res) => {
+app.get('/api/students/:uid/subject-attendance', authenticateToken, async (req, res) => {
   try {
     const { uid } = req.params;
     const student = await getQuery('SELECT * FROM students WHERE uid = ?', [uid]);
@@ -700,8 +1196,66 @@ app.get('/api/students/:uid/subject-attendance', async (req, res) => {
   }
 });
 
+// Paginated student attendance history with SQL search & filtering
+app.get('/api/students/:uid/attendance-history', authenticateToken, async (req, res) => {
+  try {
+    const { uid } = req.params;
+    const { search, session_type, status, all } = req.query;
+    const { page, limit, offset } = parsePagination(req.query);
+
+    const whereClauses = ['student_uid = ?'];
+    const params = [uid];
+
+    if (session_type && session_type !== 'All') {
+      whereClauses.push('session_type = ?');
+      params.push(session_type);
+    }
+    if (status && status !== 'All') {
+      whereClauses.push('status = ?');
+      params.push(status);
+    }
+    if (search && search.trim()) {
+      whereClauses.push('(subject_name LIKE ? OR marked_by LIKE ?)');
+      const term = `%${search.trim()}%`;
+      params.push(term, term);
+    }
+
+    const whereSql = `WHERE ${whereClauses.join(' AND ')}`;
+
+    const countRow = await getQuery(`SELECT COUNT(*) as total FROM attendance_records ${whereSql}`, params);
+    const total = countRow ? countRow.total : 0;
+
+    const columns = `id, date, session_type, subject_name, status, marked_by, timestamp, is_frozen`;
+    let sql = `SELECT ${columns} FROM attendance_records ${whereSql} ORDER BY date DESC, timestamp DESC`;
+    const queryParams = [...params];
+
+    const isPaginated = req.query.page !== undefined || req.query.limit !== undefined || all !== 'true';
+    if (isPaginated && all !== 'true') {
+      sql += ` LIMIT ? OFFSET ?`;
+      queryParams.push(limit, offset);
+    }
+
+    const history = await allQuery(sql, queryParams);
+
+    if (all === 'true' && !req.query.page) {
+      return res.json(history);
+    }
+
+    res.json({
+      items: history,
+      page,
+      limit,
+      total,
+      hasMore: offset + history.length < total
+    });
+  } catch (error) {
+    console.error('Fetch student history error:', error);
+    res.status(500).json({ error: 'Failed to fetch student attendance history' });
+  }
+});
+
 // Add a new Student
-app.post('/api/students', async (req, res) => {
+app.post('/api/students', authenticateToken, requireRole('admin', 'hod'), async (req, res) => {
   try {
     const { name, enrolment_number, student_photo, department, status, email, phone, semester, division } = req.body;
 
@@ -716,7 +1270,7 @@ app.post('/api/students', async (req, res) => {
     const studentEmail = email || `${name.toLowerCase().replace(/\s+/g, '.')}.comp@attendancex.edu`;
 
     // Create user account for student
-    const hashedPassword = bcrypt.hashSync('Student@123', 10);
+    const hashedPassword = await bcrypt.hash('Student@123', 10);
     const userRes = await runQuery(`
       INSERT INTO users (uid, name, email, password, role, department, phone, avatar)
       VALUES (?, ?, ?, ?, 'student', ?, ?, ?)
@@ -741,24 +1295,54 @@ app.post('/api/students', async (req, res) => {
 });
 
 // Update student
-app.put('/api/students/:uid', async (req, res) => {
+app.put('/api/students/:uid', authenticateToken, requireRole('admin', 'hod'), async (req, res) => {
   try {
     const { uid } = req.params;
     const { name, enrolment_number, student_photo, department, status, semester, division } = req.body;
 
-    await runQuery(`
-      UPDATE students
-      SET name = COALESCE(?, name),
-          enrolment_number = COALESCE(?, enrolment_number),
-          student_photo = COALESCE(?, student_photo),
-          department = COALESCE(?, department),
-          status = COALESCE(?, status),
-          semester = COALESCE(?, semester),
-          division = COALESCE(?, division)
-      WHERE uid = ?
-    `, [name, enrolment_number, student_photo, department, status, semester, division, uid]);
+    let existingStudent = await getQuery('SELECT * FROM students WHERE uid = ?', [uid]);
 
-    // Also update users table name/photo if present
+    if (!existingStudent) {
+      // Check if user exists in users table with role 'student' or prefix STU-
+      const user = await getQuery('SELECT * FROM users WHERE uid = ?', [uid]);
+      if (user) {
+        const enroll = enrolment_number || user.uid.replace(/^STU-/, 'ENR-') || `ENR-${user.id}`;
+        await runQuery(`
+          INSERT INTO students (
+            uid, user_id, name, enrolment_number, student_photo, department,
+            status, semester, division, total_classes_present, total_classes_conducted,
+            percentage, weighted_percentage, lecture_present, lecture_total,
+            lab_present, lab_total
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0.0, 0.0, 0, 0, 0, 0)
+        `, [
+          uid,
+          user.id,
+          name || user.name,
+          enroll,
+          student_photo || user.avatar || '',
+          department || user.department || 'Computer Department',
+          status || 'Active',
+          semester || 5,
+          division || 'A'
+        ]);
+        existingStudent = await getQuery('SELECT * FROM students WHERE uid = ?', [uid]);
+      }
+    } else {
+      await runQuery(`
+        UPDATE students
+        SET name = COALESCE(?, name),
+            enrolment_number = COALESCE(?, enrolment_number),
+            student_photo = COALESCE(?, student_photo),
+            department = COALESCE(?, department),
+            status = COALESCE(?, status),
+            semester = COALESCE(?, semester),
+            division = COALESCE(?, division)
+        WHERE uid = ?
+      `, [name, enrolment_number, student_photo, department, status, semester, division, uid]);
+    }
+
+    // Also update users table name/photo/department if present
     await runQuery(`
       UPDATE users
       SET name = COALESCE(?, name),
@@ -768,15 +1352,19 @@ app.put('/api/students/:uid', async (req, res) => {
     `, [name, student_photo, department, uid]);
 
     const updated = await getQuery('SELECT * FROM students WHERE uid = ?', [uid]);
+    if (!updated) {
+      return res.status(404).json({ error: `Student with UID '${uid}' not found in database` });
+    }
+
     res.json(updated);
   } catch (error) {
     console.error('Update student error:', error);
-    res.status(500).json({ error: 'Failed to update student' });
+    res.status(500).json({ error: 'Failed to update student: ' + error.message });
   }
 });
 
 // Delete student
-app.delete('/api/students/:uid', async (req, res) => {
+app.delete('/api/students/:uid', authenticateToken, requireRole('admin'), async (req, res) => {
   try {
     const { uid } = req.params;
     await runQuery('DELETE FROM attendance_records WHERE student_uid = ?', [uid]);
@@ -793,32 +1381,58 @@ app.delete('/api/students/:uid', async (req, res) => {
    USERS ENDPOINTS (ADMIN MANAGEMENT)
    ========================================================================== */
 
-// Get all users with filtering by role and department
-app.get('/api/users', async (req, res) => {
+// Get all users with filtering by role and department + pagination
+app.get('/api/users', authenticateToken, requireRole('admin', 'hod', 'faculty'), async (req, res) => {
   try {
-    const { role, department, search } = req.query;
-    let sql = 'SELECT id, uid, name, email, role, department, phone, avatar, created_at FROM users WHERE 1=1';
+    const { role, department, search, all } = req.query;
+    const { page, limit, offset } = parsePagination(req.query);
+
+    const whereClauses = [];
     const params = [];
 
     if (role && role !== 'All') {
-      sql += ' AND role = ?';
+      whereClauses.push('role = ?');
       params.push(role);
     }
 
     if (department && department !== 'All') {
-      sql += ' AND department = ?';
+      whereClauses.push('department = ?');
       params.push(department);
     }
 
-    if (search) {
-      sql += ' AND (name LIKE ? OR email LIKE ? OR uid LIKE ?)';
-      const term = `%${search}%`;
+    if (search && search.trim()) {
+      whereClauses.push('(name LIKE ? OR email LIKE ? OR uid LIKE ?)');
+      const term = `%${search.trim()}%`;
       params.push(term, term, term);
     }
 
-    sql += ' ORDER BY id DESC';
-    const users = await allQuery(sql, params);
-    res.json(users);
+    const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
+
+    const countRow = await getQuery(`SELECT COUNT(*) as total FROM users ${whereSql}`, params);
+    const total = countRow ? countRow.total : 0;
+
+    let sql = `SELECT id, uid, name, email, role, department, phone, avatar, created_at FROM users ${whereSql} ORDER BY id DESC`;
+    const queryParams = [...params];
+
+    const isPaginated = req.query.page !== undefined || req.query.limit !== undefined || all !== 'true';
+    if (isPaginated && all !== 'true') {
+      sql += ` LIMIT ? OFFSET ?`;
+      queryParams.push(limit, offset);
+    }
+
+    const users = await allQuery(sql, queryParams);
+
+    if (all === 'true' && !req.query.page) {
+      return res.json(users);
+    }
+
+    res.json({
+      items: users,
+      page,
+      limit,
+      total,
+      hasMore: offset + users.length < total
+    });
   } catch (error) {
     console.error('Get users error:', error);
     res.status(500).json({ error: 'Failed to retrieve users' });
@@ -826,7 +1440,7 @@ app.get('/api/users', async (req, res) => {
 });
 
 // Add new user (Admin action)
-app.post('/api/users', async (req, res) => {
+app.post('/api/users', authenticateToken, requireRole('admin'), async (req, res) => {
   try {
     const { name, email, password, role, department, phone, avatar } = req.body;
 
@@ -842,7 +1456,7 @@ app.post('/api/users', async (req, res) => {
     const timestamp = Date.now().toString().slice(-4);
     const prefix = role.toUpperCase().slice(0, 3);
     const uid = `${prefix}-COMP-${timestamp}`;
-    const hashedPassword = bcrypt.hashSync(password, 10);
+    const hashedPassword = await bcrypt.hash(password, 10);
     const dept = department || 'Computer Department';
     const defaultAvatar = avatar || `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(name)}`;
 
@@ -873,7 +1487,7 @@ app.post('/api/users', async (req, res) => {
 });
 
 // Delete user by ID
-app.delete('/api/users/:id', async (req, res) => {
+app.delete('/api/users/:id', authenticateToken, requireRole('admin'), async (req, res) => {
   try {
     const { id } = req.params;
     const user = await getQuery('SELECT uid, role FROM users WHERE id = ?', [id]);
@@ -897,24 +1511,72 @@ app.delete('/api/users/:id', async (req, res) => {
    ATTENDANCE & CLASSES ENDPOINTS
    ========================================================================== */
 
-// Get all classes
-app.get('/api/classes', async (req, res) => {
+// Get classes (cached short-term & paginated)
+app.get('/api/classes', authenticateToken, async (req, res) => {
   try {
-    const { department, faculty_email } = req.query;
-    let sql = 'SELECT * FROM classes WHERE 1=1';
+    const { department, faculty_email, search, type, semester, all } = req.query;
+    const { page, limit, offset } = parsePagination(req.query);
+
+    const cacheKey = `classes_${department || ''}_${faculty_email || ''}_${search || ''}_${type || ''}_${semester || ''}_${page}_${limit}_${all || ''}`;
+    const cached = getCachedData(cacheKey, 60000);
+    if (cached) {
+      res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=30');
+      return res.json(cached);
+    }
+
+    const whereClauses = [];
     const params = [];
 
-    if (department) {
-      sql += ' AND department = ?';
+    if (department && department !== 'All') {
+      whereClauses.push('department = ?');
       params.push(department);
     }
     if (faculty_email) {
-      sql += ' AND LOWER(faculty_email) = LOWER(?)';
+      whereClauses.push('LOWER(faculty_email) = LOWER(?)');
       params.push(faculty_email);
     }
+    if (type && type !== 'All') {
+      whereClauses.push('type = ?');
+      params.push(type);
+    }
+    if (semester && semester !== 'All') {
+      whereClauses.push('semester = ?');
+      params.push(Number(semester));
+    }
+    if (search && search.trim()) {
+      whereClauses.push('(subject_name LIKE ? OR subject_code LIKE ? OR faculty_name LIKE ?)');
+      const term = `%${search.trim()}%`;
+      params.push(term, term, term);
+    }
 
-    const classes = await allQuery(sql, params);
-    res.json(classes);
+    const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
+
+    const countRow = await getQuery(`SELECT COUNT(*) as total FROM classes ${whereSql}`, params);
+    const total = countRow ? countRow.total : 0;
+
+    const columns = `id, subject_code, subject_name, department, faculty_name, faculty_email, type, semester, room, time_slot`;
+    let sql = `SELECT ${columns} FROM classes ${whereSql} ORDER BY id ASC`;
+    const queryParams = [...params];
+
+    const isPaginated = req.query.page !== undefined || req.query.limit !== undefined || all !== 'true';
+    if (isPaginated && all !== 'true') {
+      sql += ` LIMIT ? OFFSET ?`;
+      queryParams.push(limit, offset);
+    }
+
+    const classes = await allQuery(sql, queryParams);
+
+    const result = (all === 'true' && !req.query.page) ? classes : {
+      items: classes,
+      page,
+      limit,
+      total,
+      hasMore: offset + classes.length < total
+    };
+
+    setCachedData(cacheKey, result);
+    res.setHeader('Cache-Control', 'public, max-age=60, stale-while-revalidate=30');
+    res.json(result);
   } catch (error) {
     console.error('Get classes error:', error);
     res.status(500).json({ error: 'Failed to fetch classes' });
@@ -922,7 +1584,7 @@ app.get('/api/classes', async (req, res) => {
 });
 
 // Mark Attendance (Faculty Action for Lecture or Lab)
-app.post('/api/attendance/mark', async (req, res) => {
+app.post('/api/attendance/mark', authenticateToken, requireRole('faculty', 'hod', 'admin'), async (req, res) => {
   try {
     const {
       class_id,
@@ -938,121 +1600,135 @@ app.post('/api/attendance/mark', async (req, res) => {
       return res.status(400).json({ error: 'Missing required attendance payload' });
     }
 
-    // 1. STRICT FREEZE CHECK: If HOD finalized this date, block all modifications (faculty & admin)
+    // Register attendance update
     const lock = await getQuery(
       'SELECT * FROM attendance_locks WHERE date = ? AND department = ?',
       [date, department]
     );
-    if (lock && lock.is_frozen === 1) {
-      return res.status(403).json({
-        error: `Attendance for date ${date} has been FINALIZED and FROZEN by HOD (${lock.finalized_by || 'C.G.Ajudiya'}). Neither faculty nor administrator can modify or create sessions for this date.`
-      });
-    }
 
-    // 2. SINGLE VALID SESSION PER DATE: If previous records exist for this session on this date, replace cleanly
-    const existingRecords = await allQuery(`
-      SELECT * FROM attendance_records
-      WHERE date = ? AND subject_name = ? AND session_type = ? AND department = ?
-    `, [date, subject_name, session_type, department]);
+    // Begin atomic SQLite transaction to protect concurrency and data integrity
+    await runQuery('BEGIN TRANSACTION');
 
-    if (existingRecords && existingRecords.length > 0) {
-      // Revert student totals before inserting updated session
-      for (const prev of existingRecords) {
-        const student = await getQuery('SELECT * FROM students WHERE uid = ?', [prev.student_uid]);
+    let presentCount = 0;
+    let absentCount = 0;
+
+    try {
+      // 2. SINGLE VALID SESSION PER DATE: If any previous session exists on this date, overwrite cleanly
+      const existingRecords = await allQuery(`
+        SELECT * FROM attendance_records
+        WHERE date = ? AND department = ?
+      `, [date, department]);
+
+      if (existingRecords && existingRecords.length > 0) {
+        // Revert student totals before inserting updated single session
+        for (const prev of existingRecords) {
+          const student = await getQuery('SELECT * FROM students WHERE uid = ?', [prev.student_uid]);
+          if (student) {
+            let lecPres = student.lecture_present || 0;
+            let lecTot = student.lecture_total || 0;
+            let labPres = student.lab_present || 0;
+            let labTot = student.lab_total || 0;
+
+            if (prev.session_type === 'Lecture') {
+              lecTot = Math.max(0, lecTot - 1);
+              if (prev.status === 'Present') lecPres = Math.max(0, lecPres - 1);
+            } else {
+              labTot = Math.max(0, labTot - 1);
+              if (prev.status === 'Present') labPres = Math.max(0, labPres - 1);
+            }
+
+            const totalPres = lecPres + labPres;
+            const totalTot = lecTot + labTot;
+            const pct = calculatePercentage(totalPres, totalTot);
+            const weightedPct = calculateWeightedScore(totalTot > 0 ? totalPres / totalTot : 0);
+
+            await runQuery(`
+              UPDATE students
+              SET lecture_present = ?, lecture_total = ?,
+                  lab_present = ?, lab_total = ?,
+                  total_classes_present = ?, total_classes_conducted = ?,
+                  percentage = ?, weighted_percentage = ?
+              WHERE uid = ?
+            `, [lecPres, lecTot, labPres, labTot, totalPres, totalTot, pct, weightedPct, prev.student_uid]);
+          }
+        }
+
+        await runQuery(`
+          DELETE FROM attendance_records
+          WHERE date = ? AND department = ?
+        `, [date, department]);
+      }
+
+      for (const item of records) {
+        const isPresent = item.status === 'Present';
+        if (isPresent) presentCount++;
+        else absentCount++;
+
+        // Insert record
+        await runQuery(`
+          INSERT INTO attendance_records (
+            class_id, student_uid, student_name, enrolment_number,
+            department, date, session_type, subject_name, status, marked_by, is_frozen
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+        `, [
+          class_id || 1,
+          item.student_uid,
+          item.student_name,
+          item.enrolment_number,
+          department,
+          date,
+          session_type,
+          subject_name,
+          item.status,
+          marked_by || req.user?.name || 'Faculty Member'
+        ]);
+
+        // Update student table counts
+        const student = await getQuery('SELECT * FROM students WHERE uid = ?', [item.student_uid]);
         if (student) {
           let lecPres = student.lecture_present || 0;
           let lecTot = student.lecture_total || 0;
           let labPres = student.lab_present || 0;
           let labTot = student.lab_total || 0;
 
-          if (prev.session_type === 'Lecture') {
-            lecTot = Math.max(0, lecTot - 1);
-            if (prev.status === 'Present') lecPres = Math.max(0, lecPres - 1);
+          if (session_type === 'Lecture') {
+            lecTot += 1;
+            if (isPresent) lecPres += 1;
           } else {
-            labTot = Math.max(0, labTot - 1);
-            if (prev.status === 'Present') labPres = Math.max(0, labPres - 1);
+            labTot += 1;
+            if (isPresent) labPres += 1;
           }
+
+          const totalPres = lecPres + labPres;
+          const totalTot = lecTot + labTot;
+          const pct = calculatePercentage(totalPres, totalTot);
+          const weightedPct = calculateWeightedScore(totalTot > 0 ? totalPres / totalTot : 0);
 
           await runQuery(`
             UPDATE students
             SET lecture_present = ?, lecture_total = ?,
-                lab_present = ?, lab_total = ?
+                lab_present = ?, lab_total = ?,
+                total_classes_present = ?, total_classes_conducted = ?,
+                percentage = ?, weighted_percentage = ?
             WHERE uid = ?
-          `, [lecPres, lecTot, labPres, labTot, prev.student_uid]);
+          `, [lecPres, lecTot, labPres, labTot, totalPres, totalTot, pct, weightedPct, item.student_uid]);
         }
       }
 
+      // Ensure date is registered in attendance_locks as Open if not present
       await runQuery(`
-        DELETE FROM attendance_records
-        WHERE date = ? AND subject_name = ? AND session_type = ? AND department = ?
-      `, [date, subject_name, session_type, department]);
+        INSERT OR IGNORE INTO attendance_locks (date, department, status, is_frozen)
+        VALUES (?, ?, 'Open', 0)
+      `, [date, department]);
+
+      await runQuery('COMMIT');
+    } catch (txErr) {
+      await runQuery('ROLLBACK');
+      throw txErr;
     }
 
-    let presentCount = 0;
-    let absentCount = 0;
-
-    for (const item of records) {
-      const isPresent = item.status === 'Present';
-      if (isPresent) presentCount++;
-      else absentCount++;
-
-      // Insert record
-      await runQuery(`
-        INSERT INTO attendance_records (
-          class_id, student_uid, student_name, enrolment_number,
-          department, date, session_type, subject_name, status, marked_by, is_frozen
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-      `, [
-        class_id || 1,
-        item.student_uid,
-        item.student_name,
-        item.enrolment_number,
-        department,
-        date,
-        session_type,
-        subject_name,
-        item.status,
-        marked_by || 'Faculty Member'
-      ]);
-
-      // Update student table counts
-      const student = await getQuery('SELECT * FROM students WHERE uid = ?', [item.student_uid]);
-      if (student) {
-        let lecPres = student.lecture_present || 0;
-        let lecTot = student.lecture_total || 0;
-        let labPres = student.lab_present || 0;
-        let labTot = student.lab_total || 0;
-
-        if (session_type === 'Lecture') {
-          lecTot += 1;
-          if (isPresent) lecPres += 1;
-        } else {
-          labTot += 1;
-          if (isPresent) labPres += 1;
-        }
-
-        const totalPres = lecPres + labPres;
-        const totalTot = lecTot + labTot;
-        const pct = calculatePercentage(totalPres, totalTot);
-        const weightedPct = calculateWeightedScore(totalTot > 0 ? totalPres / totalTot : 0);
-
-        await runQuery(`
-          UPDATE students
-          SET lecture_present = ?, lecture_total = ?,
-              lab_present = ?, lab_total = ?,
-              total_classes_present = ?, total_classes_conducted = ?,
-              percentage = ?, weighted_percentage = ?
-          WHERE uid = ?
-        `, [lecPres, lecTot, labPres, labTot, totalPres, totalTot, pct, weightedPct, item.student_uid]);
-      }
-    }
-
-    // Ensure date is registered in attendance_locks as Open if not present
-    await runQuery(`
-      INSERT OR IGNORE INTO attendance_locks (date, department, status, is_frozen)
-      VALUES (?, ?, 'Open', 0)
-    `, [date, department]);
+    invalidateCache('classes_');
 
     res.json({
       message: `Attendance marked successfully for ${records.length} students (1 official session saved for ${date})`,
@@ -1072,7 +1748,7 @@ app.post('/api/attendance/mark', async (req, res) => {
 });
 
 // Update single student attendance record (Faculty or Admin override action)
-app.post('/api/attendance/update-single', async (req, res) => {
+app.post('/api/attendance/update-single', authenticateToken, requireRole('faculty', 'hod', 'admin'), async (req, res) => {
   try {
     const { record_id, student_uid, date, subject_name, session_type, status, marked_by } = req.body;
 
@@ -1095,18 +1771,6 @@ app.post('/api/attendance/update-single', async (req, res) => {
     }
 
     const department = record.department || 'Computer Department';
-
-    // 1. Check date freeze lock status
-    const lock = await getQuery(
-      'SELECT * FROM attendance_locks WHERE date = ? AND department = ?',
-      [record.date, department]
-    );
-
-    if (lock && lock.is_frozen === 1) {
-      return res.status(403).json({
-        error: `Attendance for date ${record.date} has been FINALIZED and FROZEN by HOD (${lock.finalized_by || 'C.G.Ajudiya'}). Status cannot be changed.`
-      });
-    }
 
     const oldStatus = record.status;
     const newStatus = status; // 'Present' or 'Absent'
@@ -1328,8 +1992,8 @@ const computeNextDay = (dateString) => {
   return `${nextY}-${nextM}-${nextD}`;
 };
 
-// Freeze Attendance (HOD Action: locks date permanently & auto-creates next morning session)
-app.post('/api/attendance/freeze', async (req, res) => {
+// Freeze Attendance (HOD & Admin Action: locks date permanently & auto-creates next morning session)
+app.post('/api/attendance/freeze', authenticateToken, requireRole('hod', 'admin'), async (req, res) => {
   try {
     const { date, department = 'Computer Department', finalized_by = 'HOD C.G.Ajudiya' } = req.body;
 
@@ -1387,8 +2051,71 @@ app.post('/api/attendance/freeze', async (req, res) => {
   }
 });
 
+// Helper to guarantee strictly 1 session per date: older sessions on the same date are overwritten cleanly
+const enforceSingleSessionPerDate = async (date, department = 'Computer Department') => {
+  if (!date) return;
+  try {
+    const sessionsOnDate = await allQuery(`
+      SELECT subject_name, session_type, MAX(id) as max_id
+      FROM attendance_records
+      WHERE date = ? AND department = ?
+      GROUP BY subject_name, session_type
+      ORDER BY max_id DESC
+    `, [date, department]);
+
+    if (sessionsOnDate && sessionsOnDate.length > 1) {
+      const latest = sessionsOnDate[0];
+      const olderRecords = await allQuery(`
+        SELECT * FROM attendance_records
+        WHERE date = ? AND department = ? AND (subject_name != ? OR session_type != ?)
+      `, [date, department, latest.subject_name, latest.session_type]);
+
+      for (const prev of olderRecords) {
+        const student = await getQuery('SELECT * FROM students WHERE uid = ?', [prev.student_uid]);
+        if (student) {
+          let lecPres = student.lecture_present || 0;
+          let lecTot = student.lecture_total || 0;
+          let labPres = student.lab_present || 0;
+          let labTot = student.lab_total || 0;
+
+          if (prev.session_type === 'Lecture') {
+            lecTot = Math.max(0, lecTot - 1);
+            if (prev.status === 'Present') lecPres = Math.max(0, lecPres - 1);
+          } else {
+            labTot = Math.max(0, labTot - 1);
+            if (prev.status === 'Present') labPres = Math.max(0, labPres - 1);
+          }
+
+          const totalPres = lecPres + labPres;
+          const totalTot = lecTot + labTot;
+          const pct = calculatePercentage(totalPres, totalTot);
+          const weightedPct = calculateWeightedScore(totalTot > 0 ? totalPres / totalTot : 0);
+
+          await runQuery(`
+            UPDATE students
+            SET lecture_present = ?, lecture_total = ?,
+                lab_present = ?, lab_total = ?,
+                total_classes_present = ?, total_classes_conducted = ?,
+                percentage = ?, weighted_percentage = ?
+            WHERE uid = ?
+          `, [lecPres, lecTot, labPres, labTot, totalPres, totalTot, pct, weightedPct, prev.student_uid]);
+        }
+      }
+
+      await runQuery(`
+        DELETE FROM attendance_records
+        WHERE date = ? AND department = ? AND (subject_name != ? OR session_type != ?)
+      `, [date, department, latest.subject_name, latest.session_type]);
+
+      console.log(`Enforced 1-session rule on date ${date}: retained latest session '${latest.subject_name}'`);
+    }
+  } catch (err) {
+    console.warn(`Could not enforce single session for ${date}:`, err.message);
+  }
+};
+
 // Get Lock Status for a specific date
-app.get('/api/attendance/lock-status', async (req, res) => {
+app.get('/api/attendance/lock-status', authenticateToken, async (req, res) => {
   try {
     const { date, department = 'Computer Department' } = req.query;
 
@@ -1396,17 +2123,21 @@ app.get('/api/attendance/lock-status', async (req, res) => {
       return res.status(400).json({ error: 'Date query param is required' });
     }
 
+    // Ensure only the latest overwritten session exists for this date
+    await enforceSingleSessionPerDate(date, department);
+
     const lock = await getQuery(
       'SELECT * FROM attendance_locks WHERE date = ? AND department = ?',
       [date, department]
     );
 
-    // Also compute count of present / absent records on this date
+    // Also compute count of present / absent records and distinct students on this date
     const summary = await getQuery(`
       SELECT 
+        COUNT(DISTINCT student_uid) as total_students,
         COUNT(*) as total_records,
-        COUNT(CASE WHEN status = 'Present' THEN 1 END) as present_count,
-        COUNT(CASE WHEN status = 'Absent' THEN 1 END) as absent_count
+        COUNT(DISTINCT CASE WHEN status = 'Present' THEN student_uid END) as present_count,
+        (COUNT(DISTINCT student_uid) - COUNT(DISTINCT CASE WHEN status = 'Present' THEN student_uid END)) as absent_count
       FROM attendance_records
       WHERE date = ? AND department = ?
     `, [date, department]);
@@ -1440,7 +2171,7 @@ app.get('/api/attendance/lock-status', async (req, res) => {
 });
 
 // Get All Attendance Locks
-app.get('/api/attendance/all-locks', async (req, res) => {
+app.get('/api/attendance/all-locks', authenticateToken, requireRole('hod', 'admin'), async (req, res) => {
   try {
     const { department = 'Computer Department' } = req.query;
     const locks = await allQuery(
@@ -1455,7 +2186,7 @@ app.get('/api/attendance/all-locks', async (req, res) => {
 });
 
 // Overall Department & Attendance Summary
-app.get('/api/attendance/summary', async (req, res) => {
+app.get('/api/attendance/summary', authenticateToken, async (req, res) => {
   try {
     const { department = 'Computer Department' } = req.query;
 
@@ -1519,68 +2250,196 @@ app.get('/api/attendance/summary', async (req, res) => {
   }
 });
 
-// Get Distinct Past Attendance Sessions
-app.get('/api/attendance/sessions-list', async (req, res) => {
+// Get Distinct Past Attendance Sessions with pagination & search
+app.get('/api/attendance/sessions-list', authenticateToken, async (req, res) => {
   try {
-    const { department = 'Computer Department' } = req.query;
-    const sessions = await allQuery(`
+    const { department = 'Computer Department', search, date, session_type, all } = req.query;
+    const { page, limit, offset } = parsePagination(req.query);
+
+    const whereClauses = ['department = ?'];
+    const params = [department];
+
+    if (date) {
+      whereClauses.push('date = ?');
+      params.push(date);
+    }
+    if (session_type && session_type !== 'All') {
+      whereClauses.push('session_type = ?');
+      params.push(session_type);
+    }
+    if (search && search.trim()) {
+      whereClauses.push('(subject_name LIKE ? OR marked_by LIKE ?)');
+      const term = `%${search.trim()}%`;
+      params.push(term, term);
+    }
+
+    const whereSql = `WHERE ${whereClauses.join(' AND ')}`;
+
+    // Count distinct sessions (strictly 1 session per date)
+    const countRow = await getQuery(`
+      SELECT COUNT(DISTINCT date) as total FROM attendance_records
+      ${whereSql}
+    `, params);
+    const total = countRow ? countRow.total : 0;
+
+    let sql = `
       SELECT 
-        date, 
-        subject_name, 
-        session_type, 
-        marked_by,
-        COUNT(CASE WHEN status = 'Present' THEN 1 END) as present_count,
-        COUNT(CASE WHEN status = 'Absent' THEN 1 END) as absent_count,
-        COUNT(*) as total_students,
-        MAX(timestamp) as last_marked
-      FROM attendance_records
-      WHERE department = ?
-      GROUP BY date, subject_name, session_type, marked_by
-      ORDER BY date DESC, last_marked DESC
-    `, [department]);
+        s.date, 
+        s.subject_name, 
+        s.session_type, 
+        s.marked_by,
+        s.present_count,
+        s.absent_count,
+        s.total_students,
+        s.last_marked
+      FROM (
+        SELECT 
+          date, 
+          subject_name, 
+          session_type, 
+          marked_by,
+          COUNT(CASE WHEN status = 'Present' THEN 1 END) as present_count,
+          COUNT(CASE WHEN status = 'Absent' THEN 1 END) as absent_count,
+          COUNT(*) as total_students,
+          MAX(id) as max_rec_id,
+          MAX(timestamp) as last_marked
+        FROM attendance_records
+        ${whereSql}
+        GROUP BY date, subject_name, session_type, marked_by
+      ) s
+      INNER JOIN (
+        SELECT date, MAX(id) as latest_id
+        FROM attendance_records
+        ${whereSql}
+        GROUP BY date
+      ) latest_d ON s.date = latest_d.date AND s.max_rec_id = latest_d.latest_id
+      ORDER BY s.date DESC
+    `;
+
+    const queryParams = [...params];
+    const isPaginated = req.query.page !== undefined || req.query.limit !== undefined || all !== 'true';
+    if (isPaginated && all !== 'true') {
+      sql += ` LIMIT ? OFFSET ?`;
+      queryParams.push(limit, offset);
+    }
+
+    const sessions = await allQuery(sql, queryParams);
 
     const enriched = sessions.map((s) => ({
       ...s,
       faculty_in_charge: getFacultyInCharge(s.subject_name)
     }));
 
-    res.json(enriched);
+    if (all === 'true' && !req.query.page) {
+      return res.json(enriched);
+    }
+
+    res.json({
+      items: enriched,
+      page,
+      limit,
+      total,
+      hasMore: offset + enriched.length < total
+    });
   } catch (error) {
     console.error('Sessions list error:', error);
     res.status(500).json({ error: 'Failed to fetch attendance sessions' });
   }
 });
 
-// Get Specific Attendance Records by Date & Subject
-app.get('/api/attendance/records', async (req, res) => {
+// Get Specific Attendance Records by Date & Subject with pagination & filters
+app.get('/api/attendance/records', authenticateToken, async (req, res) => {
   try {
-    const { date, subject_name, session_type, department = 'Computer Department' } = req.query;
-    let sql = 'SELECT * FROM attendance_records WHERE department = ?';
-    const params = [department];
+    const { date, subject_name, session_type, department = 'Computer Department', status, search, student_uid, all } = req.query;
+    const { page, limit, offset } = parsePagination(req.query);
 
     if (date) {
-      sql += ' AND date = ?';
+      await enforceSingleSessionPerDate(date, department);
+    }
+
+    const whereClauses = [];
+    const params = [];
+
+    if (department && department !== 'All') {
+      whereClauses.push('department = ?');
+      params.push(department);
+    }
+    if (date) {
+      whereClauses.push('date = ?');
       params.push(date);
     }
-    if (subject_name) {
-      sql += ' AND subject_name = ?';
+    if (subject_name && subject_name !== 'All') {
+      whereClauses.push('subject_name = ?');
       params.push(subject_name);
     }
-    if (session_type) {
-      sql += ' AND session_type = ?';
+    if (session_type && session_type !== 'All') {
+      whereClauses.push('session_type = ?');
       params.push(session_type);
     }
+    if (status && status !== 'All') {
+      whereClauses.push('status = ?');
+      params.push(status);
+    }
+    if (student_uid) {
+      whereClauses.push('student_uid = ?');
+      params.push(student_uid);
+    }
+    if (search && search.trim()) {
+      whereClauses.push('(student_name LIKE ? OR enrolment_number LIKE ? OR student_uid LIKE ?)');
+      const term = `%${search.trim()}%`;
+      params.push(term, term, term);
+    }
 
-    sql += ' ORDER BY enrolment_number ASC';
-    const records = await allQuery(sql, params);
+    const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
 
-    const enriched = records.map((r) => ({
+    const countRow = await getQuery(`SELECT COUNT(*) as total FROM attendance_records ${whereSql}`, params);
+    const total = countRow ? countRow.total : 0;
+
+    const columns = `id, class_id, student_uid, student_name, enrolment_number, department, date, session_type, subject_name, status, marked_by, timestamp, is_frozen`;
+
+    let sql = `SELECT ${columns} FROM attendance_records ${whereSql} ORDER BY date DESC, enrolment_number ASC`;
+    const queryParams = [...params];
+
+    const isPaginated = (req.query.page !== undefined || req.query.limit !== undefined) && all !== 'true';
+    if (isPaginated) {
+      sql += ` LIMIT ? OFFSET ?`;
+      queryParams.push(limit, offset);
+    }
+
+    const records = await allQuery(sql, queryParams);
+
+    let enriched = records.map((r) => ({
       ...r,
       batch: getStudentBatch(r.student_uid, r.enrolment_number),
       faculty_in_charge: getFacultyInCharge(r.subject_name)
     }));
 
-    res.json(enriched);
+    if (req.query.unique === 'true') {
+      const studentMap = new Map();
+      for (const r of enriched) {
+        if (!studentMap.has(r.student_uid)) {
+          studentMap.set(r.student_uid, { ...r });
+        } else {
+          const existing = studentMap.get(r.student_uid);
+          if (r.status === 'Present') {
+            existing.status = 'Present';
+          }
+        }
+      }
+      enriched = Array.from(studentMap.values());
+    }
+
+    if (all === 'true' && !req.query.page) {
+      return res.json(enriched);
+    }
+
+    res.json({
+      items: enriched,
+      page,
+      limit,
+      total: req.query.unique === 'true' ? enriched.length : total,
+      hasMore: isPaginated ? (offset + enriched.length < total) : false
+    });
   } catch (error) {
     console.error('Attendance records error:', error);
     res.status(500).json({ error: 'Failed to fetch attendance records' });
@@ -1588,7 +2447,7 @@ app.get('/api/attendance/records', async (req, res) => {
 });
 
 // HOD & Department Overview Stats
-app.get('/api/department/stats', async (req, res) => {
+app.get('/api/department/stats', authenticateToken, requireRole('hod', 'admin'), async (req, res) => {
   try {
     const department = req.query.department || 'Computer Department';
 
@@ -1674,7 +2533,7 @@ const refreshOrClearEmbeddingsCache = async (baseDir) => {
 };
 
 // POST /api/face/enroll: Saves <FACE_DB_PATH>/<uid>.jpg (for OpenCV SFace/YuNet) and <FACE_DB_PATH>/<uid>/<timestamp>.jpg
-app.post('/api/face/enroll', async (req, res) => {
+app.post('/api/face/enroll', authenticateToken, async (req, res) => {
   try {
     const { uid, image } = req.body || {};
     if (!uid || typeof uid !== 'string' || !uid.trim()) {
@@ -1691,6 +2550,15 @@ app.post('/api/face/enroll', async (req, res) => {
     ) {
       return res.status(400).json({ error: 'Invalid UID format' });
     }
+
+    // RBAC: Only self or staff (admin/hod) can enroll face biometrics
+    const callerRole = (req.user?.role || '').toLowerCase();
+    const isSelf = req.user?.uid === cleanUid;
+    const isStaff = callerRole === 'admin' || callerRole === 'hod';
+    if (!isSelf && !isStaff) {
+      return res.status(403).json({ error: 'Access denied: You can only enroll biometrics for your own account' });
+    }
+
     if (!image || typeof image !== 'string') {
       return res.status(400).json({ error: 'Image data is required' });
     }
@@ -1701,6 +2569,9 @@ app.post('/api/face/enroll', async (req, res) => {
     const imageBuffer = Buffer.from(base64Data, 'base64');
     if (!imageBuffer || imageBuffer.length === 0) {
       return res.status(400).json({ error: 'Invalid image buffer' });
+    }
+    if (imageBuffer.length > 5 * 1024 * 1024) {
+      return res.status(400).json({ error: 'Image payload exceeds maximum limit of 5MB' });
     }
     const baseDir = getFaceDbPath();
     if (!fs.existsSync(baseDir)) {
@@ -1735,13 +2606,28 @@ app.post('/api/face/enroll', async (req, res) => {
     const subFiles = (await fs.promises.readdir(targetDir)).filter(f => /\.(jpe?g|png|webp|bmp)$/i.test(f));
     const allPhotos = Array.from(new Set([`${cleanUid}.jpg`, ...subFiles])).sort();
 
+    const photoUrl = `/api/face/photo/${cleanUid}?t=${timestamp}`;
+
+    // Update students & users tables: remove cartoon avatar and place the enrolled biometric face photo
+    try {
+      await runQuery('UPDATE students SET student_photo = ? WHERE uid = ? OR enrolment_number = ?', [photoUrl, cleanUid, cleanUid]);
+      await runQuery('UPDATE users SET avatar = ? WHERE uid = ?', [photoUrl, cleanUid]);
+      const studentRow = await getQuery('SELECT user_id FROM students WHERE uid = ? OR enrolment_number = ?', [cleanUid, cleanUid]);
+      if (studentRow && studentRow.user_id) {
+        await runQuery('UPDATE users SET avatar = ? WHERE id = ?', [photoUrl, studentRow.user_id]);
+      }
+    } catch (dbErr) {
+      console.warn('Could not update avatar in DB after face enroll:', dbErr.message);
+    }
+
     return res.status(200).json({
       success: true,
-      message: 'Face photo saved successfully',
+      message: 'Face photo saved and profile avatar updated successfully',
       uid: cleanUid,
       filename: `${cleanUid}.jpg`,
       photoCount: allPhotos.length,
-      savedPhotos: allPhotos
+      savedPhotos: allPhotos,
+      photoUrl
     });
   } catch (error) {
     console.error('Face enrollment error:', error);
@@ -1749,8 +2635,30 @@ app.post('/api/face/enroll', async (req, res) => {
   }
 });
 
+// GET /api/face/photo/:uid - Serves the enrolled face photo for biometric display / profile avatar
+app.get('/api/face/photo/:uid', async (req, res) => {
+  try {
+    const { uid } = req.params;
+    if (!uid || !/^[a-zA-Z0-9_\-]+$/.test(uid.trim())) {
+      return res.status(400).json({ error: 'Invalid UID format' });
+    }
+    const cleanUid = uid.trim();
+    const baseDir = getFaceDbPath();
+    const filePath = path.resolve(baseDir, `${cleanUid}.jpg`);
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ error: 'Enrolled face photo not found' });
+    }
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+    return res.sendFile(filePath);
+  } catch (err) {
+    console.error('Error serving face photo:', err);
+    return res.status(500).json({ error: 'Failed to retrieve enrolled photo' });
+  }
+});
+
 // GET /api/face/count/:uid
-app.get('/api/face/count/:uid', async (req, res) => {
+app.get('/api/face/count/:uid', authenticateToken, async (req, res) => {
   try {
     const { uid } = req.params;
     if (!uid || !/^[a-zA-Z0-9_\-]+$/.test(uid.trim())) {

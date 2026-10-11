@@ -23,9 +23,28 @@ async function runFaceEnrollmentTest() {
   const dummy1x1JpgBase64 = 'data:image/jpeg;base64,/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wgALCAABAAEBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA=';
 
   try {
+    // 0. Authenticate as Admin
+    console.log('0. Authenticating admin account...');
+    const loginRes = await fetch(`${API_BASE}/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: 'raviadmin@attendancex.edu',
+        password: 'Admin@123',
+        role: 'admin'
+      })
+    });
+    const loginData = await loginRes.json();
+    const token = loginData.token;
+    if (!token) throw new Error('Failed to obtain admin token for face test');
+    const authHeaders = {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`
+    };
+
     // 1. Initial count check
     console.log('1. Checking initial photo count...');
-    const countRes1 = await fetch(`${API_BASE}/face/count/${testUid}`);
+    const countRes1 = await fetch(`${API_BASE}/face/count/${testUid}`, { headers: authHeaders });
     const countData1 = await countRes1.json();
     console.log('   Current photo count:', countData1.photoCount);
 
@@ -33,7 +52,7 @@ async function runFaceEnrollmentTest() {
     console.log('2. Enrolling test face snapshot...');
     const enrollRes = await fetch(`${API_BASE}/face/enroll`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authHeaders,
       body: JSON.stringify({
         uid: testUid,
         image: dummy1x1JpgBase64
@@ -48,7 +67,7 @@ async function runFaceEnrollmentTest() {
 
     // 3. Verify count updated
     console.log('3. Verifying updated photo count...');
-    const countRes2 = await fetch(`${API_BASE}/face/count/${testUid}`);
+    const countRes2 = await fetch(`${API_BASE}/face/count/${testUid}`, { headers: authHeaders });
     const countData2 = await countRes2.json();
     console.log('   Updated photo count:', countData2.photoCount);
 

@@ -12,6 +12,9 @@ export const db = new sqlite3.Database(dbPath, (err) => {
     console.error('Error opening database:', err.message);
   } else {
     console.log('Connected to SQLite database: attendancex.db');
+    db.run('PRAGMA journal_mode = WAL;');
+    db.run('PRAGMA busy_timeout = 5000;');
+    db.run('PRAGMA foreign_keys = ON;');
   }
 });
 
@@ -183,6 +186,8 @@ export const initDatabase = async () => {
       department TEXT DEFAULT 'Computer Department',
       phone TEXT,
       avatar TEXT,
+      google_id TEXT UNIQUE,
+      google_email TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
@@ -267,6 +272,9 @@ export const initDatabase = async () => {
     if (!hasFrozenCol) {
       await runQuery(`ALTER TABLE attendance_records ADD COLUMN is_frozen INTEGER DEFAULT 0`);
     }
+    // High-performance compound indexes for fast attendance queries
+    await runQuery(`CREATE INDEX IF NOT EXISTS idx_att_date_dept ON attendance_records(date, department, session_type)`);
+    await runQuery(`CREATE INDEX IF NOT EXISTS idx_att_student ON attendance_records(student_uid, date)`);
   } catch (err) {
     console.warn('Could not verify/add is_frozen column to attendance_records:', err.message);
   }
@@ -296,6 +304,77 @@ export const initDatabase = async () => {
     }
   } catch (err) {
     console.warn('Could not update student divisions:', err.message);
+  }
+
+  // Ensure exactly 1 session per date: remove older overwritten sessions on any date
+  try {
+    const multiSessionDates = await allQuery(`
+      SELECT date, department, COUNT(DISTINCT subject_name) as sub_count
+      FROM attendance_records
+      GROUP BY date, department
+      HAVING sub_count > 1
+    `);
+
+    for (const d of multiSessionDates) {
+      // Find the latest session for this date by MAX(id)
+      const latest = await getQuery(`
+        SELECT subject_name, session_type, MAX(id) as max_id
+        FROM attendance_records
+        WHERE date = ? AND department = ?
+        GROUP BY subject_name, session_type
+        ORDER BY max_id DESC
+        LIMIT 1
+      `, [d.date, d.department]);
+
+      if (latest) {
+        // Find older records on this date to revert & remove
+        const olderRecords = await allQuery(`
+          SELECT * FROM attendance_records
+          WHERE date = ? AND department = ? AND (subject_name != ? OR session_type != ?)
+        `, [d.date, d.department, latest.subject_name, latest.session_type]);
+
+        for (const prev of olderRecords) {
+          const student = await getQuery('SELECT * FROM students WHERE uid = ?', [prev.student_uid]);
+          if (student) {
+            let lecPres = student.lecture_present || 0;
+            let lecTot = student.lecture_total || 0;
+            let labPres = student.lab_present || 0;
+            let labTot = student.lab_total || 0;
+
+            if (prev.session_type === 'Lecture') {
+              lecTot = Math.max(0, lecTot - 1);
+              if (prev.status === 'Present') lecPres = Math.max(0, lecPres - 1);
+            } else {
+              labTot = Math.max(0, labTot - 1);
+              if (prev.status === 'Present') labPres = Math.max(0, labPres - 1);
+            }
+
+            const totalPres = lecPres + labPres;
+            const totalTot = lecTot + labTot;
+            const pct = calculatePercentage(totalPres, totalTot);
+            const weightedPct = calculateWeightedScore(totalTot > 0 ? totalPres / totalTot : 0);
+
+            await runQuery(`
+              UPDATE students
+              SET lecture_present = ?, lecture_total = ?,
+                  lab_present = ?, lab_total = ?,
+                  total_classes_present = ?, total_classes_conducted = ?,
+                  percentage = ?, weighted_percentage = ?
+              WHERE uid = ?
+            `, [lecPres, lecTot, labPres, labTot, totalPres, totalTot, pct, weightedPct, prev.student_uid]);
+          }
+        }
+
+        await runQuery(`
+          DELETE FROM attendance_records
+          WHERE date = ? AND department = ? AND (subject_name != ? OR session_type != ?)
+        `, [d.date, d.department, latest.subject_name, latest.session_type]);
+
+        console.log(`Cleaned up duplicate sessions for ${d.date}: kept single latest session '${latest.subject_name}'`);
+      }
+    }
+  } catch (err) {
+    console.warn('Could not enforce 1-session cleanup on startup:', err.message);
   }
 
   // Create Email OTP Verifications table
@@ -346,7 +425,21 @@ export const initDatabase = async () => {
   `);
   await runQuery(`CREATE INDEX IF NOT EXISTS idx_password_reset_token ON password_reset_authorizations(token_hash)`);
 
-  // Ensure setup_status and email_verified_at columns exist on users table
+  // Performance Indexes for high-speed queries, pagination, and joins
+  await runQuery(`CREATE INDEX IF NOT EXISTS idx_attendance_student_uid ON attendance_records(student_uid)`);
+  await runQuery(`CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance_records(date)`);
+  await runQuery(`CREATE INDEX IF NOT EXISTS idx_attendance_class_id ON attendance_records(class_id)`);
+  await runQuery(`CREATE INDEX IF NOT EXISTS idx_attendance_composite ON attendance_records(student_uid, date, session_type)`);
+  await runQuery(`CREATE INDEX IF NOT EXISTS idx_attendance_session_lookup ON attendance_records(date, subject_name, session_type, department)`);
+  await runQuery(`CREATE INDEX IF NOT EXISTS idx_classes_dept_email ON classes(department, faculty_email)`);
+  await runQuery(`CREATE INDEX IF NOT EXISTS idx_students_enrolment ON students(enrolment_number)`);
+  await runQuery(`CREATE INDEX IF NOT EXISTS idx_students_dept_status ON students(department, status)`);
+  await runQuery(`CREATE INDEX IF NOT EXISTS idx_students_percentage ON students(percentage)`);
+  await runQuery(`CREATE INDEX IF NOT EXISTS idx_users_role_dept ON users(role, department)`);
+  await runQuery(`CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)`);
+  await runQuery(`CREATE INDEX IF NOT EXISTS idx_attendance_locks_date_dept ON attendance_locks(date, department)`);
+
+  // Ensure setup_status, email_verified_at, google_id, and google_email columns exist on users table
   try {
     const userTableInfo = await allQuery(`PRAGMA table_info(users)`);
     const hasSetupStatus = userTableInfo.some((col) => col.name === 'setup_status');
@@ -357,8 +450,41 @@ export const initDatabase = async () => {
     if (!hasEmailVerifiedAt) {
       await runQuery(`ALTER TABLE users ADD COLUMN email_verified_at DATETIME`);
     }
+    const hasGoogleId = userTableInfo.some((col) => col.name === 'google_id');
+    if (!hasGoogleId) {
+      await runQuery(`ALTER TABLE users ADD COLUMN google_id TEXT`);
+      await runQuery(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_id ON users(google_id) WHERE google_id IS NOT NULL`);
+    }
+    const hasGoogleEmail = userTableInfo.some((col) => col.name === 'google_email');
+    if (!hasGoogleEmail) {
+      await runQuery(`ALTER TABLE users ADD COLUMN google_email TEXT`);
+    }
   } catch (err) {
-    console.warn('Could not verify/add setup columns to users table:', err.message);
+    console.warn('Could not verify/add setup and google columns to users table:', err.message);
+  }
+
+  // Synchronize any student accounts from users table into students table
+  try {
+    const missingStudents = await allQuery(`
+      SELECT u.id as user_id, u.uid, u.name, u.department, u.avatar
+      FROM users u
+      LEFT JOIN students s ON u.uid = s.uid
+      WHERE (u.role = 'student' OR u.uid LIKE 'STU-%') AND s.uid IS NULL
+    `);
+    for (const m of missingStudents) {
+      const enroll = m.uid.replace(/^STU-/, 'ENR-') || `ENR-${m.user_id}`;
+      await runQuery(`
+        INSERT OR IGNORE INTO students (
+          uid, user_id, name, enrolment_number, student_photo, department,
+          status, semester, division, total_classes_present, total_classes_conducted,
+          percentage, weighted_percentage, lecture_present, lecture_total,
+          lab_present, lab_total
+        )
+        VALUES (?, ?, ?, ?, ?, ?, 'Active', 5, 'A', 0, 0, 0.0, 0.0, 0, 0, 0, 0)
+      `, [m.uid, m.user_id, m.name, enroll, m.avatar || '', m.department || 'Computer Department']);
+    }
+  } catch (err) {
+    console.warn('Could not sync student records:', err.message);
   }
 
   // Seed default data if users table is empty
