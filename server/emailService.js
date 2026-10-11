@@ -1,7 +1,8 @@
 import nodemailer from 'nodemailer';
 import { SmtpClient } from './smtpClient.js';
+import { Resend, sendResendEmail, isResendConfigured } from './resendClient.js';
 
-export { nodemailer, SmtpClient };
+export { nodemailer, SmtpClient, Resend, sendResendEmail, isResendConfigured };
 
 /**
  * AttendanceX Email Delivery Service
@@ -254,21 +255,35 @@ export const sendVerificationOtpEmail = async ({ recipientEmail, purpose, otp })
     };
   }
 
-  // Attempt real delivery using configured SMTP credentials
-  if (!smtpClient.isConfigured()) {
-    if (process.env.EMAIL_TEST_MODE === 'true') {
-      console.warn(`[EmailService] SMTP credentials not configured. Simulating delivery to ${recipientEmail}.`);
-      emailDeliveryLogs.push({ ...deliveryRecord, delivered: true, simulated: true });
+  // 1. Attempt delivery via Resend HTTP API (Primary for cloud/Render to bypass blocked SMTP ports)
+  if (isResendConfigured()) {
+    try {
+      const result = await sendResendEmail({
+        to: recipientEmail,
+        subject,
+        text,
+        html,
+        from: process.env.RESEND_FROM || 'onboarding@resend.dev'
+      });
+
+      emailDeliveryLogs.push({ ...deliveryRecord, delivered: true, provider: 'resend', messageId: result.messageId });
       return {
         success: true,
         delivered: true,
-        messageId: `<dev-${Date.now()}@attendancex.edu>`,
+        provider: 'resend',
+        messageId: result.messageId,
         recipient: recipientEmail
       };
+    } catch (error) {
+      console.error(`[EmailService] Resend delivery failed to ${recipientEmail}:`, error.message);
+      emailDeliveryLogs.push({ ...deliveryRecord, delivered: false, provider: 'resend', error: error.message });
+      throw new Error(`Email delivery failed: ${error.message}`);
     }
+  }
 
-    // In real mode, missing credentials must be explicitly configured
-    throw new Error('SMTP credentials are not configured in server/.env. Please set SMTP_USER and SMTP_PASS (Gmail App Password) to send real verification emails.');
+  // 2. Fallback to Nodemailer SMTP if Resend is not configured
+  if (!smtpClient.isConfigured()) {
+    throw new Error('Email credentials are not configured. Please set RESEND_API_KEY in server/.env with your key from https://resend.com');
   }
 
   try {
@@ -279,17 +294,18 @@ export const sendVerificationOtpEmail = async ({ recipientEmail, purpose, otp })
       html
     });
 
-    emailDeliveryLogs.push({ ...deliveryRecord, delivered: true, messageId: result.messageId });
+    emailDeliveryLogs.push({ ...deliveryRecord, delivered: true, provider: 'smtp', messageId: result.messageId });
     return {
       success: true,
       delivered: true,
+      provider: 'smtp',
       messageId: result.messageId,
       recipient: recipientEmail
     };
   } catch (error) {
     // Handle email delivery failures without falsely reporting success
     console.error(`[EmailService] Delivery failed to ${recipientEmail}:`, error.message);
-    emailDeliveryLogs.push({ ...deliveryRecord, delivered: false, error: error.message });
+    emailDeliveryLogs.push({ ...deliveryRecord, delivered: false, provider: 'smtp', error: error.message });
     throw new Error(`Email delivery failed: ${error.message}`);
   }
 };
@@ -301,13 +317,30 @@ export const sendEmailChangeNotice = async ({ oldEmail, newEmail }) => {
   if (!oldEmail || !oldEmail.includes('@')) return false;
 
   const { subject, html, text } = buildEmailChangeAlertTemplate({ oldEmail, newEmail });
-  const smtpClient = new SmtpClient();
 
   if (process.env.EMAIL_TEST_MODE === 'true' || process.env.NODE_ENV === 'test') {
     emailDeliveryLogs.push({ recipient: oldEmail, purpose: 'email_changed_notice', delivered: true });
     return true;
   }
 
+  // Use Resend if configured
+  if (isResendConfigured()) {
+    try {
+      await sendResendEmail({
+        to: oldEmail,
+        subject,
+        text,
+        html,
+        from: process.env.RESEND_FROM || 'onboarding@resend.dev'
+      });
+      return true;
+    } catch (err) {
+      console.warn(`[EmailService] Failed to notify old email ${oldEmail} via Resend:`, err.message);
+      return false;
+    }
+  }
+
+  const smtpClient = new SmtpClient();
   if (!smtpClient.isConfigured()) {
     return true; // Best effort notification in dev
   }

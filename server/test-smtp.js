@@ -32,16 +32,21 @@ console.log('Connecting to Google SMTP...');
 
 const transportOpts = host.includes('gmail')
   ? {
-      service: 'gmail',
+      host: 'smtp.gmail.com',
+      port,
+      secure: port === 465,
+      family: 4, // Force IPv4
       auth: { user, pass },
-      connectionTimeout: 10000
+      connectionTimeout: 12000,
+      tls: { minVersion: 'TLSv1.2' }
     }
   : {
       host,
       port,
       secure: process.env.SMTP_SECURE === 'true' || port === 465,
+      family: 4,
       auth: { user, pass },
-      connectionTimeout: 10000
+      connectionTimeout: 12000
     };
 
 const transporter = nodemailer.createTransport(transportOpts);
