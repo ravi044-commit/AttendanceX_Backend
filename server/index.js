@@ -204,7 +204,7 @@ const requireRole = (...allowedRoles) => (req, res, next) => {
    ========================================================================== */
 
 // Deployment Health Check (used by Render, Railway, Docker, AWS ECS, Uptime monitors)
-app.get('/api/health', async (req, res) => {
+const handleHealthCheck = async (req, res) => {
   try {
     const dbCheck = await getQuery('SELECT 1 as alive');
     res.json({
@@ -223,7 +223,10 @@ app.get('/api/health', async (req, res) => {
       error: error.message
     });
   }
-});
+};
+
+app.get('/api/health', handleHealthCheck);
+app.get('/health', handleHealthCheck);
 
 /* ==========================================================================
    AUTH ROUTES

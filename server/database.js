@@ -13,7 +13,8 @@ export const db = new sqlite3.Database(dbPath, (err) => {
   } else {
     console.log('Connected to SQLite database: attendancex.db');
     db.run('PRAGMA journal_mode = WAL;');
-    db.run('PRAGMA busy_timeout = 5000;');
+    db.run('PRAGMA synchronous = NORMAL;');
+    db.run('PRAGMA busy_timeout = 10000;');
     db.run('PRAGMA foreign_keys = ON;');
   }
 });
@@ -498,174 +499,180 @@ export const initDatabase = async () => {
 const seedInitialData = async () => {
   const hashPass = (pw) => bcrypt.hashSync(pw, 10);
 
-  // 1. Departments
-  await runQuery(`
-    INSERT INTO departments (name, code, hod_name, total_students, avg_attendance)
-    VALUES ('Computer Department', 'COMP', 'C.G.Ajudiya', 99, 88.9)
-  `);
+  // Wrap all seeding operations in a single atomic transaction for 100x faster startup
+  await runQuery('BEGIN TRANSACTION');
+  try {
+    // 1. Departments
+    await runQuery(`
+      INSERT INTO departments (name, code, hod_name, total_students, avg_attendance)
+      VALUES ('Computer Department', 'COMP', 'C.G.Ajudiya', 99, 88.9)
+    `);
 
-  // 2. Default Accounts for Admin, HOD, and Faculty
-  const staffUsers = [
-    {
-      uid: 'ADM-001',
-      name: 'Ravi',
-      email: 'raviadmin@attendancex.edu',
-      password: hashPass('Admin@123'),
-      role: 'admin',
-      department: 'Computer Department',
-      phone: '',
-      avatar: ''
-    },
-    {
-      uid: 'HOD-COMP-01',
-      name: 'C.G.Ajudiya',
-      email: 'hod.cg.ajudiya@attendancex.edu',
-      password: hashPass('Hod@123'),
-      role: 'hod',
-      department: 'Computer Department',
-      phone: '',
-      avatar: ''
-    },
-    {
-      uid: 'FAC-COMP-101',
-      name: 'J.D.Vadalia',
-      email: 'faculty.jd.vadalia@attendancex.edu',
-      password: hashPass('Faculty@123'),
-      role: 'faculty',
-      department: 'Computer Department',
-      phone: '',
-      avatar: ''
-    },
-    {
-      uid: 'FAC-COMP-102',
-      name: 'P.V.Patel',
-      email: 'faculty.pv.patel@attendancex.edu',
-      password: hashPass('Faculty@123'),
-      role: 'faculty',
-      department: 'Computer Department',
-      phone: '',
-      avatar: ''
-    },
-    {
-      uid: 'FAC-COMP-103',
-      name: 'J.V.Shparia',
-      email: 'faculty.jv.shparia@attendancex.edu',
-      password: hashPass('Faculty@123'),
-      role: 'faculty',
-      department: 'Computer Department',
-      phone: '',
-      avatar: ''
-    },
-    {
-      uid: 'FAC-COMP-104',
-      name: 'Shubham',
-      email: 'faculty.shubham@attendancex.edu',
-      password: hashPass('Faculty@123'),
-      role: 'faculty',
-      department: 'Computer Department',
-      phone: '',
-      avatar: ''
+    // 2. Default Accounts for Admin, HOD, and Faculty
+    const staffUsers = [
+      {
+        uid: 'ADM-001',
+        name: 'Ravi',
+        email: 'raviadmin@attendancex.edu',
+        password: hashPass('Admin@123'),
+        role: 'admin',
+        department: 'Computer Department',
+        phone: '',
+        avatar: ''
+      },
+      {
+        uid: 'HOD-COMP-01',
+        name: 'C.G.Ajudiya',
+        email: 'hod.cg.ajudiya@attendancex.edu',
+        password: hashPass('Hod@123'),
+        role: 'hod',
+        department: 'Computer Department',
+        phone: '',
+        avatar: ''
+      },
+      {
+        uid: 'FAC-COMP-101',
+        name: 'J.D.Vadalia',
+        email: 'faculty.jd.vadalia@attendancex.edu',
+        password: hashPass('Faculty@123'),
+        role: 'faculty',
+        department: 'Computer Department',
+        phone: '',
+        avatar: ''
+      },
+      {
+        uid: 'FAC-COMP-102',
+        name: 'P.V.Patel',
+        email: 'faculty.pv.patel@attendancex.edu',
+        password: hashPass('Faculty@123'),
+        role: 'faculty',
+        department: 'Computer Department',
+        phone: '',
+        avatar: ''
+      },
+      {
+        uid: 'FAC-COMP-103',
+        name: 'J.V.Shparia',
+        email: 'faculty.jv.shparia@attendancex.edu',
+        password: hashPass('Faculty@123'),
+        role: 'faculty',
+        department: 'Computer Department',
+        phone: '',
+        avatar: ''
+      },
+      {
+        uid: 'FAC-COMP-104',
+        name: 'Shubham',
+        email: 'faculty.shubham@attendancex.edu',
+        password: hashPass('Faculty@123'),
+        role: 'faculty',
+        department: 'Computer Department',
+        phone: '',
+        avatar: ''
+      }
+    ];
+
+    for (const u of staffUsers) {
+      await runQuery(`
+        INSERT INTO users (uid, name, email, password, role, department, phone, avatar)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `, [u.uid, u.name, u.email, u.password, u.role, u.department, u.phone, u.avatar]);
     }
-  ];
 
-  for (const u of staffUsers) {
-    await runQuery(`
-      INSERT INTO users (uid, name, email, password, role, department, phone, avatar)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `, [u.uid, u.name, u.email, u.password, u.role, u.department, u.phone, u.avatar]);
-  }
+    // 3. Classes (Computer Department - 5th Semester, wef 05.08.26)
+    const classesList = [
+      { code: 'DI05000151', name: 'IOT - Internet of Things (Lecture)', type: 'Lecture', faculty: 'C.G.Ajudiya', email: 'hod.cg.ajudiya@attendancex.edu', room: 'Room-209', time: 'Mon 12:30-1:30 | Thu 10:30-11:30' },
+      { code: 'DI05000151', name: 'IOT Lab - Internet of Things Laboratory', type: 'Lab', faculty: 'C.G.Ajudiya', email: 'hod.cg.ajudiya@attendancex.edu', room: 'Lab-201B / Lab-203', time: 'Mon 2:00-4:00 (B) | Wed 11:30-1:30 (A)' },
+      { code: 'DI05000111', name: 'ST - Software Testing (Lecture)', type: 'Lecture', faculty: 'J.D.Vadalia', email: 'faculty.jd.vadalia@attendancex.edu', room: 'Room-209', time: 'Mon 11:30-12:30 | Wed 3:00-4:00 | Fri 12:30-1:30' },
+      { code: 'DI05000111', name: 'ST Lab - Software Testing Laboratory', type: 'Lab', faculty: 'J.D.Vadalia', email: 'faculty.jd.vadalia@attendancex.edu', room: 'Lab-203', time: 'Tue 11:30-1:30 (A) | Wed 11:30-1:30 (B)' },
+      { code: 'DI05007021', name: 'IS - Information Security (Lecture)', type: 'Lecture', faculty: 'P.V.Patel', email: 'faculty.pv.patel@attendancex.edu', room: 'Room-209', time: 'Tue 3:00-4:00 | Wed 2:00-3:00 | Thu 12:30-1:30' },
+      { code: 'DI05007021', name: 'IS Lab - Information Security Laboratory', type: 'Lab', faculty: 'P.V.Patel', email: 'faculty.pv.patel@attendancex.edu', room: 'Lab-115', time: 'Tue 11:30-1:30 (B) | Thu 2:00-4:00 (A)' },
+      { code: 'DI05000181', name: 'CHSM - Computer Hardware Architecture and System Maintenance (Lecture)', type: 'Lecture', faculty: 'J.V.Shparia', email: 'faculty.jv.shparia@attendancex.edu', room: 'Room-209', time: 'Tue 2:00-3:00 | Thu 11:30-12:30 | Fri 11:30-12:30' },
+      { code: 'DI05000181', name: 'CHSM Lab - Computer Hardware Architecture and System Maintenance Lab', type: 'Lab', faculty: 'J.V.Shparia', email: 'faculty.jv.shparia@attendancex.edu', room: 'Lab-114', time: 'Mon 2:00-4:00 (A) | Thu 2:00-4:00 (B)' },
+      { code: 'DI05000121', name: 'Vibe Lab - Project & Practical Innovation Lab', type: 'Lab', faculty: 'Shubham', email: 'faculty.shubham@attendancex.edu', room: 'Computer Center / Lab-114', time: 'Fri 2:00-4:00 (Batches A & B)' }
+    ];
 
-  // 3. Classes (Computer Department - 5th Semester, wef 05.08.26)
-  const classesList = [
-    { code: 'DI05000151', name: 'IOT - Internet of Things (Lecture)', type: 'Lecture', faculty: 'C.G.Ajudiya', email: 'hod.cg.ajudiya@attendancex.edu', room: 'Room-209', time: 'Mon 12:30-1:30 | Thu 10:30-11:30' },
-    { code: 'DI05000151', name: 'IOT Lab - Internet of Things Laboratory', type: 'Lab', faculty: 'C.G.Ajudiya', email: 'hod.cg.ajudiya@attendancex.edu', room: 'Lab-201B / Lab-203', time: 'Mon 2:00-4:00 (B) | Wed 11:30-1:30 (A)' },
-    { code: 'DI05000111', name: 'ST - Software Testing (Lecture)', type: 'Lecture', faculty: 'J.D.Vadalia', email: 'faculty.jd.vadalia@attendancex.edu', room: 'Room-209', time: 'Mon 11:30-12:30 | Wed 3:00-4:00 | Fri 12:30-1:30' },
-    { code: 'DI05000111', name: 'ST Lab - Software Testing Laboratory', type: 'Lab', faculty: 'J.D.Vadalia', email: 'faculty.jd.vadalia@attendancex.edu', room: 'Lab-203', time: 'Tue 11:30-1:30 (A) | Wed 11:30-1:30 (B)' },
-    { code: 'DI05007021', name: 'IS - Information Security (Lecture)', type: 'Lecture', faculty: 'P.V.Patel', email: 'faculty.pv.patel@attendancex.edu', room: 'Room-209', time: 'Tue 3:00-4:00 | Wed 2:00-3:00 | Thu 12:30-1:30' },
-    { code: 'DI05007021', name: 'IS Lab - Information Security Laboratory', type: 'Lab', faculty: 'P.V.Patel', email: 'faculty.pv.patel@attendancex.edu', room: 'Lab-115', time: 'Tue 11:30-1:30 (B) | Thu 2:00-4:00 (A)' },
-    { code: 'DI05000181', name: 'CHSM - Computer Hardware Architecture and System Maintenance (Lecture)', type: 'Lecture', faculty: 'J.V.Shparia', email: 'faculty.jv.shparia@attendancex.edu', room: 'Room-209', time: 'Tue 2:00-3:00 | Thu 11:30-12:30 | Fri 11:30-12:30' },
-    { code: 'DI05000181', name: 'CHSM Lab - Computer Hardware Architecture and System Maintenance Lab', type: 'Lab', faculty: 'J.V.Shparia', email: 'faculty.jv.shparia@attendancex.edu', room: 'Lab-114', time: 'Mon 2:00-4:00 (A) | Thu 2:00-4:00 (B)' },
-    { code: 'DI05000121', name: 'Vibe Lab - Project & Practical Innovation Lab', type: 'Lab', faculty: 'Shubham', email: 'faculty.shubham@attendancex.edu', room: 'Computer Center / Lab-114', time: 'Fri 2:00-4:00 (Batches A & B)' }
-  ];
+    for (const c of classesList) {
+      await runQuery(`
+        INSERT INTO classes (subject_code, subject_name, department, faculty_name, faculty_email, type, semester, room, time_slot)
+        VALUES (?, ?, 'Computer Department', ?, ?, ?, 5, ?, ?)
+      `, [c.code, c.name, c.faculty, c.email, c.type, c.room, c.time]);
+    }
 
-  for (const c of classesList) {
-    await runQuery(`
-      INSERT INTO classes (subject_code, subject_name, department, faculty_name, faculty_email, type, semester, room, time_slot)
-      VALUES (?, ?, 'Computer Department', ?, ?, ?, 5, ?, ?)
-    `, [c.code, c.name, c.faculty, c.email, c.type, c.room, c.time]);
-  }
+    // 4. Seed all 99 real students
+    for (const s of rawStudentList) {
+      const formattedUid = `STU-COMP-${String(s.uid).padStart(3, '0')}`;
+      const email = `${s.enrollment_number}@attendancex.edu`;
+      const studentPassword = hashPass(s.enrollment_number);
+      const avatar = `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(s.name)}`;
 
-  // 4. Seed all 99 real students
-  // Each student logs in with <enrolment_number>@attendancex.edu and a password
-  // equal to their OWN enrolment number (unique per student, not shared).
+      const isAbsent = s.status === 'Absent';
+      const lecTotal = 30;
+      const labTotal = 20;
+      const totalClasses = lecTotal + labTotal;
 
-  for (const s of rawStudentList) {
-    const formattedUid = `STU-COMP-${String(s.uid).padStart(3, '0')}`;
-    const email = `${s.enrollment_number}@attendancex.edu`;
-    const studentPassword = hashPass(s.enrollment_number);
-    const avatar = `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(s.name)}`;
+      const lecPres = isAbsent ? Math.floor(15 + Math.random() * 5) : Math.floor(25 + Math.random() * 5);
+      const labPres = isAbsent ? Math.floor(10 + Math.random() * 4) : Math.floor(17 + Math.random() * 3);
+      const totalPres = lecPres + labPres;
 
-    const isAbsent = s.status === 'Absent';
-    const lecTotal = 30;
-    const labTotal = 20;
-    const totalClasses = lecTotal + labTotal;
+      const percentage = calculatePercentage(totalPres, totalClasses);
+      const weightedScore = calculateWeightedScore(totalPres / totalClasses);
+      const studentStatus = isAbsent ? 'On Leave' : 'Active';
 
-    const lecPres = isAbsent ? Math.floor(15 + Math.random() * 5) : Math.floor(25 + Math.random() * 5);
-    const labPres = isAbsent ? Math.floor(10 + Math.random() * 4) : Math.floor(17 + Math.random() * 3);
-    const totalPres = lecPres + labPres;
+      const userRes = await runQuery(`
+        INSERT INTO users (uid, name, email, password, role, department, avatar)
+        VALUES (?, ?, ?, ?, 'student', 'Computer Department', ?)
+      `, [formattedUid, s.name, email, studentPassword, avatar]);
 
-    const percentage = calculatePercentage(totalPres, totalClasses);
-    const weightedScore = calculateWeightedScore(totalPres / totalClasses);
-    const studentStatus = isAbsent ? 'On Leave' : 'Active';
+      const batchName = s.uid <= 63 ? 'Batch A' : 'Batch B';
 
-    const userRes = await runQuery(`
-      INSERT INTO users (uid, name, email, password, role, department, avatar)
-      VALUES (?, ?, ?, ?, 'student', 'Computer Department', ?)
-    `, [formattedUid, s.name, email, studentPassword, avatar]);
+      await runQuery(`
+        INSERT INTO students (
+          uid, user_id, name, enrolment_number, student_photo, department,
+          semester, division, status, total_classes_present, total_classes_conducted,
+          percentage, weighted_percentage, lecture_present, lecture_total,
+          lab_present, lab_total
+        )
+        VALUES (?, ?, ?, ?, ?, 'Computer Department', 6, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        formattedUid, userRes.id, s.name, s.enrollment_number, avatar,
+        batchName, studentStatus, totalPres, totalClasses, percentage, weightedScore,
+        lecPres, lecTotal, labPres, labTotal
+      ]);
+    }
 
-    const batchName = s.uid <= 63 ? 'Batch A' : 'Batch B';
+    // 5. Seed Attendance Records for recent dates
+    const dates = ['2026-08-22', '2026-08-23', '2026-08-24', '2026-08-25'];
+    const subjects = [
+      { name: 'IOT - Internet of Things (Lecture)', type: 'Lecture', faculty: 'C.G.Ajudiya' },
+      { name: 'ST - Software Testing (Lecture)', type: 'Lecture', faculty: 'J.D.Vadalia' },
+      { name: 'IS - Information Security (Lecture)', type: 'Lecture', faculty: 'P.V.Patel' },
+      { name: 'CHSM - Computer Hardware Architecture and System Maintenance (Lecture)', type: 'Lecture', faculty: 'J.V.Shparia' }
+    ];
 
-    await runQuery(`
-      INSERT INTO students (
-        uid, user_id, name, enrolment_number, student_photo, department,
-        semester, division, status, total_classes_present, total_classes_conducted,
-        percentage, weighted_percentage, lecture_present, lecture_total,
-        lab_present, lab_total
-      )
-      VALUES (?, ?, ?, ?, ?, 'Computer Department', 6, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `, [
-      formattedUid, userRes.id, s.name, s.enrollment_number, avatar,
-      batchName, studentStatus, totalPres, totalClasses, percentage, weightedScore,
-      lecPres, lecTotal, labPres, labTotal
-    ]);
-  }
+    for (const date of dates) {
+      for (const sub of subjects) {
+        for (const s of rawStudentList) {
+          const formattedUid = `STU-COMP-${String(s.uid).padStart(3, '0')}`;
+          const isPresent = s.status === 'Present' ? (Math.random() > 0.08) : (Math.random() > 0.6);
+          const status = isPresent ? 'Present' : 'Absent';
 
-  // 5. Seed Attendance Records for recent dates
-  const dates = ['2026-08-22', '2026-08-23', '2026-08-24', '2026-08-25'];
-  const subjects = [
-    { name: 'IOT - Internet of Things (Lecture)', type: 'Lecture', faculty: 'C.G.Ajudiya' },
-    { name: 'ST - Software Testing (Lecture)', type: 'Lecture', faculty: 'J.D.Vadalia' },
-    { name: 'IS - Information Security (Lecture)', type: 'Lecture', faculty: 'P.V.Patel' },
-    { name: 'CHSM - Computer Hardware Architecture and System Maintenance (Lecture)', type: 'Lecture', faculty: 'J.V.Shparia' }
-  ];
-
-  for (const date of dates) {
-    for (const sub of subjects) {
-      for (const s of rawStudentList) {
-        const formattedUid = `STU-COMP-${String(s.uid).padStart(3, '0')}`;
-        const isPresent = s.status === 'Present' ? (Math.random() > 0.08) : (Math.random() > 0.6);
-        const status = isPresent ? 'Present' : 'Absent';
-
-        await runQuery(`
-          INSERT INTO attendance_records (
-            class_id, student_uid, student_name, enrolment_number,
-            department, date, session_type, subject_name, status, marked_by
-          )
-          VALUES (1, ?, ?, ?, 'Computer Department', ?, ?, ?, ?, ?)
-        `, [formattedUid, s.name, s.enrollment_number, date, sub.type, sub.name, status, sub.faculty]);
+          await runQuery(`
+            INSERT INTO attendance_records (
+              class_id, student_uid, student_name, enrolment_number,
+              department, date, session_type, subject_name, status, marked_by
+            )
+            VALUES (1, ?, ?, ?, 'Computer Department', ?, ?, ?, ?, ?)
+          `, [formattedUid, s.name, s.enrollment_number, date, sub.type, sub.name, status, sub.faculty]);
+        }
       }
     }
-  }
 
-  console.log('Database initialized with 99 students successfully!');
+    await runQuery('COMMIT');
+    console.log('Database initialized with 99 students successfully in a single atomic transaction!');
+  } catch (err) {
+    await runQuery('ROLLBACK');
+    console.error('Failed to seed initial data, transaction rolled back:', err);
+    throw err;
+  }
 };
