@@ -13,11 +13,11 @@ const testOtp = Math.floor(100000 + Math.random() * 900000).toString();
 const recipient = (process.argv[2] || 'ravilaptop978@gmail.com').replace('--to=', '').trim();
 
 console.log('\n======================================================');
-console.log('       AttendanceX OTP Email Dispatch via Resend       ');
+console.log('        AttendanceX OTP Email Dispatch via Brevo       ');
 console.log('======================================================');
 console.log(`Generated OTP: >>> ${testOtp} <<<`);
 console.log(`Recipient:     ${recipient}`);
-console.log(`Provider:      Resend API (HTTPS Port 443)`);
+console.log(`Provider:      Brevo API (HTTPS Port 443)`);
 console.log('======================================================\n');
 
 async function main() {

@@ -1,8 +1,12 @@
 import nodemailer from 'nodemailer';
 import { SmtpClient } from './smtpClient.js';
-import { Resend, sendResendEmail, isResendConfigured } from './resendClient.js';
+import { sendBrevoEmail, isBrevoConfigured } from './brevoClient.js';
 
-export { nodemailer, SmtpClient, Resend, sendResendEmail, isResendConfigured };
+// Retain all existing exports and backward-compatible aliases
+export { nodemailer, SmtpClient, sendBrevoEmail, isBrevoConfigured };
+export const sendResendEmail = sendBrevoEmail;
+export const isResendConfigured = isBrevoConfigured;
+export const Resend = null;
 
 /**
  * AttendanceX Email Delivery Service
@@ -255,35 +259,34 @@ export const sendVerificationOtpEmail = async ({ recipientEmail, purpose, otp })
     };
   }
 
-  // 1. Attempt delivery via Resend HTTP API (Primary for cloud/Render to bypass blocked SMTP ports)
-  if (isResendConfigured()) {
+  // 1. Attempt delivery via Brevo HTTP API (Primary for cloud/Render to bypass blocked SMTP ports)
+  if (isBrevoConfigured()) {
     try {
-      const result = await sendResendEmail({
+      const result = await sendBrevoEmail({
         to: recipientEmail,
         subject,
         text,
-        html,
-        from: process.env.RESEND_FROM || 'onboarding@resend.dev'
+        html
       });
 
-      emailDeliveryLogs.push({ ...deliveryRecord, delivered: true, provider: 'resend', messageId: result.messageId });
+      emailDeliveryLogs.push({ ...deliveryRecord, delivered: true, provider: 'brevo', messageId: result.messageId });
       return {
         success: true,
         delivered: true,
-        provider: 'resend',
+        provider: 'brevo',
         messageId: result.messageId,
         recipient: recipientEmail
       };
     } catch (error) {
-      console.error(`[EmailService] Resend delivery failed to ${recipientEmail}:`, error.message);
-      emailDeliveryLogs.push({ ...deliveryRecord, delivered: false, provider: 'resend', error: error.message });
+      console.error(`[EmailService] Brevo delivery failed to ${recipientEmail}:`, error.message);
+      emailDeliveryLogs.push({ ...deliveryRecord, delivered: false, provider: 'brevo', error: error.message });
       throw new Error(`Email delivery failed: ${error.message}`);
     }
   }
 
-  // 2. Fallback to Nodemailer SMTP if Resend is not configured
+  // 2. Fallback to Nodemailer SMTP if Brevo is not configured
   if (!smtpClient.isConfigured()) {
-    throw new Error('Email credentials are not configured. Please set RESEND_API_KEY in server/.env with your key from https://resend.com');
+    throw new Error('Email credentials are not configured. Please set BREVO_API_KEY and BREVO_SENDER in server/.env');
   }
 
   try {
@@ -323,19 +326,18 @@ export const sendEmailChangeNotice = async ({ oldEmail, newEmail }) => {
     return true;
   }
 
-  // Use Resend if configured
-  if (isResendConfigured()) {
+  // Use Brevo HTTP API if configured
+  if (isBrevoConfigured()) {
     try {
-      await sendResendEmail({
+      await sendBrevoEmail({
         to: oldEmail,
         subject,
         text,
-        html,
-        from: process.env.RESEND_FROM || 'onboarding@resend.dev'
+        html
       });
       return true;
     } catch (err) {
-      console.warn(`[EmailService] Failed to notify old email ${oldEmail} via Resend:`, err.message);
+      console.warn(`[EmailService] Failed to notify old email ${oldEmail} via Brevo:`, err.message);
       return false;
     }
   }
