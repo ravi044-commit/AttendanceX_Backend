@@ -42,7 +42,7 @@ const studentExists = async (enrol) => {
 
         const percentage = calculatePercentage(totalPres, totalClasses);
         const weightedScore = calculateWeightedScore(totalPres / totalClasses);
-        const studentStatus = isAbsent ? 'On Leave' : 'Active';
+        const studentStatus = 'Active';
 
         // ---- insert the student record --------------------------------------------
         await runQuery(

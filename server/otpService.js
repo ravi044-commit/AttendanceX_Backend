@@ -73,7 +73,7 @@ export const generateSecureOtp = () => {
  * Request & Generate OTP for a specific purpose
  * Dispatches via EmailService, saves hashed record in DB
  */
-export const requestOtp = async ({ email, purpose, userId = null }) => {
+export const requestOtp = async ({ email, purpose, userId = null, password = null, requirePasswordCheck = false }) => {
   const input = email ? email.trim() : '';
 
   if (!input) {
@@ -88,10 +88,10 @@ export const requestOtp = async ({ email, purpose, userId = null }) => {
   let associatedUserId = userId;
 
   if (purpose === 'password_recovery') {
-    let existingUser = await getQuery('SELECT id, email FROM users WHERE LOWER(email) = LOWER(?)', [normalizedEmail]);
+    let existingUser = await getQuery('SELECT id, email, password FROM users WHERE LOWER(email) = LOWER(?)', [normalizedEmail]);
     if (!existingUser) {
       existingUser = await getQuery(`
-        SELECT u.id, u.email FROM users u
+        SELECT u.id, u.email, u.password FROM users u
         LEFT JOIN students s ON (s.user_id = u.id OR s.uid = u.uid)
         WHERE LOWER(u.uid) = LOWER(?) OR s.enrolment_number = ? OR LOWER(u.email) = LOWER(? || '@attendancex.edu')
         LIMIT 1
@@ -100,6 +100,17 @@ export const requestOtp = async ({ email, purpose, userId = null }) => {
     if (!existingUser) {
       throw new Error(`No registered account found with email or enrollment number "${input}". Please check your details or contact your administrator.`);
     }
+
+    if (requirePasswordCheck) {
+      if (!password) {
+        throw new Error('AttendanceX password is required');
+      }
+      const isPasswordValid = existingUser.password ? bcrypt.compareSync(password, existingUser.password) : false;
+      if (!isPasswordValid) {
+        throw new Error('Incorrect AttendanceX password. Verification code cannot be sent.');
+      }
+    }
+
     associatedUserId = existingUser.id;
     // Deliver to the registered account email
     normalizedEmail = existingUser.email.toLowerCase();
@@ -190,7 +201,8 @@ await runQuery(`
 
   const responseData = {
     success: true,
-    message: 'Verification code sent successfully to your email',
+    message: `Verification code sent successfully to ${normalizedEmail}`,
+    email: normalizedEmail,
     purpose,
     expiresInSeconds: Math.floor(OTP_EXPIRY_MS / 1000)
   };
@@ -219,14 +231,16 @@ export const verifyOtp = async ({ email, otp, purpose, userId = null }) => {
   }
 
   let targetEmail = normalizedEmail;
-  if (!targetEmail.includes('@') && purpose === 'password_recovery') {
+  if (purpose === 'password_recovery') {
     const userRow = await getQuery(`
       SELECT u.email FROM users u
       LEFT JOIN students s ON (s.user_id = u.id OR s.uid = u.uid)
-      WHERE LOWER(u.uid) = LOWER(?) OR s.enrolment_number = ?
+      WHERE LOWER(u.email) = LOWER(?) OR LOWER(u.uid) = LOWER(?) OR s.enrolment_number = ? OR LOWER(u.email) = LOWER(? || '@attendancex.edu')
       LIMIT 1
-    `, [normalizedEmail, normalizedEmail]);
-    if (userRow) targetEmail = userRow.email.toLowerCase();
+    `, [normalizedEmail, normalizedEmail, normalizedEmail, normalizedEmail]);
+    if (userRow && userRow.email) {
+      targetEmail = userRow.email.toLowerCase();
+    }
   }
 
   // Retrieve active OTP record for exact email and purpose

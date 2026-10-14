@@ -48,11 +48,15 @@ export const allQuery = (sql, params = []) => {
 
 export const calculatePercentage = (present, total) => {
   if (!total || total === 0) return 0;
-  return Number(((present / total) * 100).toFixed(2));
+  const validPres = Math.max(0, present);
+  const validTot = Math.max(validPres, total);
+  const rawPct = Number(((validPres / validTot) * 100).toFixed(2));
+  return rawPct > 95 ? 95 : rawPct;
 };
 
 export const calculateWeightedScore = (presentRatio) => {
-  return Number((0.30 * (presentRatio * 182.5)).toFixed(2));
+  const ratio = Math.min(Math.max(0, presentRatio), 0.95);
+  return Number((0.30 * (ratio * 182.5)).toFixed(2));
 };
 
 export const rawStudentList = [
@@ -216,7 +220,7 @@ export const initDatabase = async () => {
       department TEXT DEFAULT 'Computer Department',
       semester INTEGER DEFAULT 5,
       division TEXT DEFAULT 'A',
-      status TEXT DEFAULT 'Active' CHECK(status IN ('Active', 'On Leave', 'Detained', 'Inactive')),
+      status TEXT DEFAULT 'Active' CHECK(status IN ('Active', 'Detained')),
       total_classes_present INTEGER DEFAULT 0,
       total_classes_conducted INTEGER DEFAULT 0,
       percentage REAL DEFAULT 0.0,
@@ -307,6 +311,26 @@ export const initDatabase = async () => {
     console.warn('Could not update student divisions:', err.message);
   }
 
+  // Ensure student statuses are strictly Active or Detained (migrate any 'On Leave' or invalid values)
+  try {
+    await runQuery(`UPDATE students SET status = 'Active' WHERE status = 'On Leave' OR (status != 'Active' AND status != 'Detained')`);
+  } catch (err) {
+    console.warn('Could not update student statuses:', err.message);
+  }
+
+  // Cleanup any future dummy dates (> today / 17th date) and ensure current active dates are Open
+  try {
+    const d = new Date();
+    const todayStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    await runQuery(`DELETE FROM attendance_locks WHERE date > ? OR date > '2026-10-15'`, [todayStr]);
+    await runQuery(`DELETE FROM attendance_records WHERE date > ? OR date > '2026-10-15'`, [todayStr]);
+    // Ensure current active dates are Open (unfreeze if inadvertently locked during testing)
+    await runQuery(`UPDATE attendance_locks SET status = 'Open', is_frozen = 0 WHERE date = ? OR date IN ('2026-10-14', '2026-10-15')`, [todayStr]);
+    await runQuery(`UPDATE attendance_records SET is_frozen = 0 WHERE date = ? OR date IN ('2026-10-14', '2026-10-15')`, [todayStr]);
+  } catch (err) {
+    console.warn('Could not clean future attendance locks:', err.message);
+  }
+
   // Ensure exactly 1 session per date: remove older overwritten sessions on any date
   try {
     const multiSessionDates = await allQuery(`
@@ -350,8 +374,10 @@ export const initDatabase = async () => {
               if (prev.status === 'Present') labPres = Math.max(0, labPres - 1);
             }
 
+            lecPres = Math.min(lecPres, lecTot);
+            labPres = Math.min(labPres, labTot);
             const totalPres = lecPres + labPres;
-            const totalTot = lecTot + labTot;
+            const totalTot = Math.max(totalPres, lecTot + labTot);
             const pct = calculatePercentage(totalPres, totalTot);
             const weightedPct = calculateWeightedScore(totalTot > 0 ? totalPres / totalTot : 0);
 
@@ -617,7 +643,7 @@ const seedInitialData = async () => {
 
       const percentage = calculatePercentage(totalPres, totalClasses);
       const weightedScore = calculateWeightedScore(totalPres / totalClasses);
-      const studentStatus = isAbsent ? 'On Leave' : 'Active';
+      const studentStatus = 'Active';
 
       const userRes = await runQuery(`
         INSERT INTO users (uid, name, email, password, role, department, avatar)

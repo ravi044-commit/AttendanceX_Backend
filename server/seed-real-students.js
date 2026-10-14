@@ -174,7 +174,7 @@ async function seedRealStudents() {
 
     const percentage = calculatePercentage(totalPres, totalClasses);
     const weightedScore = calculateWeightedScore(totalPres / totalClasses);
-    const studentStatus = isAbsent ? 'On Leave' : 'Active';
+    const studentStatus = 'Active';
 
     // Insert user account for login
     const userRes = await runQuery(`
