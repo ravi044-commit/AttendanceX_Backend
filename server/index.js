@@ -2366,8 +2366,13 @@ app.get('/api/attendance/sessions-list', authenticateToken, async (req, res) => 
     const { department = 'Computer Department', search, date, session_type, all } = req.query;
     const { page, limit, offset } = parsePagination(req.query);
 
-    const whereClauses = ['department = ?'];
-    const params = [department];
+    const whereClauses = [];
+    const params = [];
+
+    if (department && department !== 'All') {
+      whereClauses.push('department = ?');
+      params.push(department);
+    }
 
     if (date) {
       whereClauses.push('date = ?');
@@ -2383,7 +2388,7 @@ app.get('/api/attendance/sessions-list', authenticateToken, async (req, res) => 
       params.push(term, term);
     }
 
-    const whereSql = `WHERE ${whereClauses.join(' AND ')}`;
+    const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
 
     // Count distinct sessions strictly by date
     const countRow = await getQuery(`
